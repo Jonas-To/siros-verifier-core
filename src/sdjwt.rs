@@ -130,6 +130,183 @@ impl IssuerKeyResolver for StaticKey {
     }
 }
 
+/// Issuer keys the host resolved ahead of verification: the JWT-VC
+/// (non-HAIP) profile, where an SD-JWT names its signing key by `kid` alone
+/// and the issuer publishes the key in its JWKS — discovered through
+/// `/.well-known/jwt-vc-issuer`. Sans-IO holds: the fetch is the host's;
+/// this resolver only consumes what it preloaded.
+///
+/// Resolution follows the token's own carrier, never a silent fallback: an
+/// `x5c` header (HAIP) resolves through [`X5cLeaf`] exactly as before, and a
+/// token carrying neither carrier is refused. A present-but-unusable carrier
+/// is an error, so a broken chain cannot be rescued by a preloaded key the
+/// deployer may not have meant to honor, and vice versa.
+#[derive(Debug, Default)]
+pub struct IssuerJwksPreloaded {
+    /// `(iss, kid)` -> the issuer's public key, fetched and selected by the host.
+    keys: HashMap<(String, String), Jwk>,
+}
+
+impl IssuerJwksPreloaded {
+    /// Record a key the host resolved for an `(iss, kid)` pair. Public halves
+    /// only: a private `d` here would hand presentation-time trust to
+    /// whatever produced the JWKS document.
+    pub fn insert(&mut self, iss: &str, kid: &str, jwk: Jwk) {
+        self.keys.insert((iss.to_owned(), kid.to_owned()), jwk);
+    }
+
+    /// How many keys the host preloaded (for tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether the host preloaded nothing at all (for tests and diagnostics).
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+}
+
+impl IssuerKeyResolver for IssuerJwksPreloaded {
+    fn resolve(&self, header: &JoseHeader, iss: &str) -> Result<ResolvedKey> {
+        if header.x5c.is_some() {
+            return X5cLeaf.resolve(header, iss);
+        }
+        let Some(kid) = header.kid.as_deref() else {
+            return Err(malformed(
+                "issuer jwt names no key: no x5c header and no kid",
+            ));
+        };
+        let Some(jwk) = self.keys.get(&(iss.to_owned(), kid.to_owned())) else {
+            return Err(malformed(format!("issuer jwks has no key for kid {kid:?}")));
+        };
+        if jwk.d.is_some() || jwk.k.is_some() {
+            // The host refuses private material at preload; defense in depth.
+            // `k` is the signing secret itself for a symmetric JWK — a
+            // public issuer key is never either.
+            return Err(malformed("issuer jwks entry carries private key material"));
+        }
+        Ok(ResolvedKey {
+            jwk: jwk.clone(),
+            x5c_der: Vec::new(),
+        })
+    }
+}
+
+/// The JWT-VC issuer metadata document at `{iss}/.well-known/jwt-vc-issuer`:
+/// `{ "issuer": ..., "jwks_uri": ... }`. Both members are REQUIRED, and both
+/// MUST be `https` URLs with a host and no userinfo or fragment, so a token's
+/// `iss` can never steer the host into a private network or a credentials
+/// leak through the fetched locations.
+pub fn parse_jwt_vc_issuer_metadata(value: &Value) -> Result<(String, String)> {
+    let issuer = https_url_member(value, "issuer")?;
+    let jwks_uri = https_url_member(value, "jwks_uri")?;
+    Ok((issuer, jwks_uri))
+}
+
+fn https_url_member(value: &Value, name: &str) -> Result<String> {
+    let url = value
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed(format!("issuer metadata has no {name}")))?;
+    let parsed = url::Url::parse(url)
+        .map_err(|_| malformed(format!("issuer metadata {name} is not a URL")))?;
+    if parsed.scheme() != "https" {
+        return Err(malformed(format!("issuer metadata {name} is not https")));
+    }
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(malformed(format!(
+            "issuer metadata {name} is not an allowed URL"
+        )));
+    }
+    Ok(url.to_owned())
+}
+
+/// Select the one key a `kid` names from an issuer's JWKS. Exactly one key
+/// may carry the `kid`; a `use` member, when present, must be `sig`; an
+/// `alg` member, when present, must match the token's; private material is
+/// refused — a JWKS is a public document.
+pub fn select_jwks_key(jwks: &Value, kid: &str, alg: &str) -> Result<Jwk> {
+    let keys = jwks
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("issuer jwks has no keys array"))?;
+    let mut found = None;
+    for key in keys {
+        let key_kid = key.get("kid").and_then(Value::as_str);
+        if key_kid != Some(kid) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(malformed(format!(
+                "issuer jwks has more than one key for kid {kid:?}"
+            )));
+        }
+        if let Some(use_) = key.get("use").and_then(Value::as_str) {
+            if use_ != "sig" {
+                return Err(malformed(
+                    "issuer jwks key for the kid is not for signatures",
+                ));
+            }
+        }
+        if let Some(key_alg) = key.get("alg").and_then(Value::as_str) {
+            if key_alg != alg {
+                return Err(malformed(format!(
+                    "issuer jwks key alg {key_alg:?} does not match the token's {alg:?}"
+                )));
+            }
+        }
+        if key.get("d").is_some() || key.get("k").is_some() {
+            // `k` is the signing secret itself for a symmetric (oct) JWK:
+            // a published secret signs for anyone who read the JWKS.
+            return Err(malformed("issuer jwks key carries private key material"));
+        }
+        if key.get("kty").and_then(Value::as_str) == Some("oct") {
+            return Err(malformed("issuer jwks key is symmetric"));
+        }
+        let jwk: Jwk = serde_json::from_value(key.clone())
+            .map_err(|e| malformed(format!("issuer jwks key for the kid is not a JWK: {e}")))?;
+        found = Some(jwk);
+    }
+    found.ok_or_else(|| malformed(format!("issuer jwks has no key for kid {kid:?}")))
+}
+
+/// Peek the `(iss, kid, alg)` an SD-JWT's issuer-signed JWT names, without
+/// verifying anything: the host preloads exactly the issuer keys a response
+/// will need before handing the token to [`verify`]. `Ok(None)` means
+/// nothing to preload: a token carrying an `x5c` header resolves through
+/// its own chain at verification — even a broken chain must fail THERE,
+/// not by fetching a JWKS the token never asked for — and a token with no
+/// `kid` has nothing for a JWKS lookup to match. The `iss` and `kid` are
+/// unverified hints — [`verify`] re-reads both from verified data, and
+/// [`IssuerJwksPreloaded`] misses on a mismatch rather than trusting them.
+pub fn issuer_key_hint(presentation: &str) -> Result<Option<(String, String, String)>> {
+    if presentation.len() > MAX_INPUT {
+        return Err(policy("presentation exceeds policy limit"));
+    }
+    let (jwt, ..) = split(presentation)?;
+    let header = decode_header(jwt)?;
+    if header.x5c.is_some() {
+        return Ok(None);
+    }
+    let Some(kid) = header.kid.clone() else {
+        return Ok(None);
+    };
+    let Some(payload) = jwt.split('.').nth(1) else {
+        return Err(malformed("JWT has no payload"));
+    };
+    let payload = payload_object(&b64u_decode(payload)?)?;
+    let iss = payload
+        .get("iss")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("missing iss"))?
+        .to_owned();
+    Ok(Some((iss, kid, header.alg.clone())))
+}
+
 pub fn x5c_chain(header: &JoseHeader) -> Result<Vec<Vec<u8>>> {
     header
         .x5c

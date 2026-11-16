@@ -1,4 +1,6 @@
+use base64::Engine;
 use jose_rs::jwk::Jwk;
+use jose_rs::JoseHeader;
 use serde_json::{json, Value};
 use siros_verifier_core::sdjwt::*;
 use siros_verifier_core::testutil::*;
@@ -676,4 +678,269 @@ fn x5c_issuer_evidence_and_status() {
         "a pinned-key resolution carries no chain evidence"
     );
     assert_eq!(pinned.issuer.iss, "https://issuer.example");
+}
+
+// ── The JWT-VC (non-HAIP) kid/JWKS issuer profile ─────────────────────────
+
+#[test]
+fn jwt_vc_issuer_metadata_is_strict() {
+    let ok = json!({
+        "issuer": "https://issuer.example",
+        "jwks_uri": "https://issuer.example/jwks",
+    });
+    let (issuer, jwks_uri) = parse_jwt_vc_issuer_metadata(&ok).unwrap();
+    assert_eq!(issuer, "https://issuer.example");
+    assert_eq!(jwks_uri, "https://issuer.example/jwks");
+
+    for bad in [
+        json!({"jwks_uri": "https://issuer.example/jwks"}),
+        json!({"issuer": "https://issuer.example"}),
+        json!({"issuer": "http://issuer.example", "jwks_uri": "https://i.example/jwks"}),
+        json!({"issuer": "https://issuer.example", "jwks_uri": "ftp://i.example/jwks"}),
+        json!({"issuer": "https://user:pw@issuer.example", "jwks_uri": "https://i.example/jwks"}),
+        json!({"issuer": "https://issuer.example#frag", "jwks_uri": "https://i.example/jwks"}),
+        json!("not even an object"),
+    ] {
+        assert!(parse_jwt_vc_issuer_metadata(&bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn jwks_selection_is_strict() {
+    let key = serde_json::to_value(public_of(&ec_jwk("ES256", "iss-1"))).unwrap();
+    let mut jwks = json!({ "keys": [] });
+    jwks["keys"].as_array_mut().unwrap().push(key);
+    jwks["keys"][0]["kid"] = json!("key-1");
+    jwks["keys"][0]["use"] = json!("sig");
+
+    let selected = select_jwks_key(&jwks, "key-1", "ES256").unwrap();
+    assert_eq!(selected.kid.as_deref(), Some("key-1"));
+
+    let mut duplicate = jwks.clone();
+    duplicate["keys"]
+        .as_array_mut()
+        .unwrap()
+        .push(jwks["keys"][0].clone());
+    assert!(
+        select_jwks_key(&duplicate, "key-1", "ES256").is_err(),
+        "a duplicate kid is ambiguous"
+    );
+
+    let mut encryption_use = jwks.clone();
+    encryption_use["keys"][0]["use"] = json!("enc");
+    assert!(
+        select_jwks_key(&encryption_use, "key-1", "ES256").is_err(),
+        "use=enc is not a signing key"
+    );
+
+    let mut wrong_alg = jwks.clone();
+    wrong_alg["keys"][0]["alg"] = json!("ES384");
+    assert!(
+        select_jwks_key(&wrong_alg, "key-1", "ES256").is_err(),
+        "the alg must agree"
+    );
+
+    let mut private_material = jwks.clone();
+    private_material["keys"][0]["d"] = json!("secret-scalar");
+    assert!(
+        select_jwks_key(&private_material, "key-1", "ES256").is_err(),
+        "a JWKS is a public document"
+    );
+
+    assert!(
+        select_jwks_key(&jwks, "other-kid", "ES256").is_err(),
+        "no match"
+    );
+    assert!(
+        select_jwks_key(&json!({"keys": "no"}), "key-1", "ES256").is_err(),
+        "no keys array"
+    );
+}
+
+#[test]
+fn kid_profile_token_verifies_through_the_preloaded_jwks() {
+    let f = fx();
+    let issued = issue(&f.issuer, &spec(&f)).unwrap();
+    let p = present(
+        &issued,
+        &[],
+        Some(kb(&f, "verifier", "n1")),
+        HashAlg::Sha256,
+    )
+    .unwrap();
+
+    // The hint names exactly what the host must preload: the token's own
+    // iss, the kid its header carries, and the alg the key must agree with.
+    let (iss, kid, alg) = issuer_key_hint(&p).unwrap().expect("a kid-profile hint");
+    assert_eq!(iss, "https://issuer.example");
+    assert_eq!(kid, "iss-1");
+    assert_eq!(alg, "ES256");
+
+    let mut preloaded = IssuerJwksPreloaded::default();
+    preloaded.insert(&iss, &kid, public_of(&f.issuer));
+    assert_eq!(preloaded.len(), 1);
+
+    let v = verify(&p, &preloaded, &params("verifier", "n1")).unwrap();
+    // The JWKS-resolved key carries no chain: the trust layer sees the jwk
+    // and an empty x5c, exactly like a pinned key.
+    assert!(v.issuer.x5c_der.is_empty());
+    assert_eq!(v.issuer.jwk.kid.as_deref(), Some("iss-1"));
+
+    // A kid the host never preloaded fails closed, naming the key.
+    let empty = IssuerJwksPreloaded::default();
+    let err = verify(&p, &empty, &params("verifier", "n1")).unwrap_err();
+    assert_eq!(err.code(), "malformed");
+    assert!(err.to_string().contains("no key for kid"), "{err}");
+}
+
+#[test]
+fn preloaded_jwks_follow_the_tokens_carrier() {
+    let mut preloaded = IssuerJwksPreloaded::default();
+    preloaded.insert(
+        "https://issuer.example",
+        "known-kid",
+        public_of(&ec_jwk("ES256", "k")),
+    );
+
+    // An x5c carrier resolves through the leaf — and never consults the
+    // preloaded map, so a broken chain is the leaf's own error.
+    let mut x5c_header = JoseHeader::new("ES256");
+    x5c_header.kid = Some("known-kid".to_owned());
+    x5c_header.x5c = Some(vec!["bm90LWEtY2VydA".to_owned()]);
+    let err = preloaded
+        .resolve(&x5c_header, "https://issuer.example")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("x5c"),
+        "the x5c carrier must decide: {err}"
+    );
+
+    // Neither carrier is refused outright.
+    let bare = JoseHeader::new("ES256");
+    let err = preloaded
+        .resolve(&bare, "https://issuer.example")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("no x5c header and no kid"),
+        "{err}"
+    );
+
+    // A kid under a different issuer is a different key slot.
+    let mut other_iss = JoseHeader::new("ES256");
+    other_iss.kid = Some("known-kid".to_owned());
+    let err = preloaded
+        .resolve(&other_iss, "https://other.example")
+        .unwrap_err();
+    assert!(err.to_string().contains("no key for kid"), "{err}");
+}
+
+#[test]
+fn the_hint_skips_x5c_carriers() {
+    let f = fx();
+    // An x5c-carrying token never asks for a JWKS fetch, even with a kid set:
+    // its chain resolves at verification, and a broken chain must fail there.
+    let issued = issue(&f.issuer, &spec(&f)).unwrap();
+    let (header_b64, rest) = issued.jwt.split_once('.').unwrap();
+    let pad = |s: &str| format!("{s}{}", "=".repeat((4 - s.len() % 4) % 4));
+    let header = base64::engine::general_purpose::URL_SAFE
+        .decode(pad(header_b64).as_bytes())
+        .unwrap();
+    let mut with_chain: Value = serde_json::from_slice(&header).unwrap();
+    with_chain["x5c"] = json!(["bm90LWEtY2VydA"]);
+    let spliced = format!(
+        "{}.{rest}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&with_chain).unwrap())
+    );
+    let p = present(
+        &Issued {
+            jwt: spliced,
+            disclosures: issued.disclosures.clone(),
+        },
+        &[],
+        None,
+        HashAlg::Sha256,
+    )
+    .unwrap();
+    assert_eq!(
+        issuer_key_hint(&p).unwrap(),
+        None,
+        "an x5c carrier preloads nothing"
+    );
+}
+
+#[test]
+fn symmetric_secrets_are_never_public_issuer_keys() {
+    let mut jwks = json!({ "keys": [] });
+    jwks["keys"].as_array_mut().unwrap().push(json!({
+        "kty": "oct", "k": "c2VjcmV0", "kid": "sym-1", "alg": "HS256", "use": "sig"
+    }));
+    let err = select_jwks_key(&jwks, "sym-1", "HS256").unwrap_err();
+    assert!(
+        err.to_string().contains("symmetric") || err.to_string().contains("private"),
+        "{err}"
+    );
+
+    let mut with_k = json!({ "keys": [] });
+    with_k["keys"].as_array_mut().unwrap().push(json!({
+        "kty": "EC", "crv": "P-256", "x": "AA", "y": "AA", "k": "c2VjcmV0", "kid": "k-1"
+    }));
+    assert!(
+        select_jwks_key(&with_k, "k-1", "ES256").is_err(),
+        "a k member is secret material"
+    );
+
+    // The resolver's own guard, for hosts that preload without the selector.
+    let mut preloaded = IssuerJwksPreloaded::default();
+    let mut secret = ec_jwk("ES256", "sym-2");
+    secret.k = Some("c2VjcmV0".to_owned());
+    preloaded.insert("https://issuer.example", "sym-2", secret);
+    let mut header = JoseHeader::new("ES256");
+    header.kid = Some("sym-2".to_owned());
+    let err = preloaded
+        .resolve(&header, "https://issuer.example")
+        .unwrap_err();
+    assert!(err.to_string().contains("private key material"), "{err}");
+}
+
+#[test]
+fn an_expired_session_is_refused_on_the_split_path_too() {
+    use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
+    use siros_verifier_core::oid4vp::{open_response, process_opened_response, Session};
+
+    let mut enc_key = ec_jwk("ECDH-ES", "enc-1");
+    enc_key.use_ = Some("enc".to_owned());
+    let session = Session {
+        client_id: "x509_hash:test".to_owned(),
+        nonce: "n".to_owned(),
+        state: "s".to_owned(),
+        response_uri: "https://verifier.example/vp/response/x".to_owned(),
+        dcql_query: json!({"credentials": [{"id": "eudi_pid", "format": "dc+sd-jwt", "claims": []}]}),
+        expires_at: 1_800_000_000,
+        enc_key,
+        response_mode: "direct_post.jwt".to_owned(),
+        dc_api_origin: None,
+    };
+    let body = json!({"vp_token": {"eudi_pid": ["x"]}, "state": "s"});
+    let mut header = JoseHeader::for_jwe(JweAlgorithm::EcdhEs, JweEncryption::A128GCM);
+    header.kid = session.enc_key.kid.clone();
+    let jwe = siros_verifier_core::testutil::encrypt_response(
+        &session.enc_key.to_public_jwk(),
+        header,
+        body.to_string().as_bytes(),
+        JweEncryption::A128GCM,
+    )
+    .expect("jwe");
+    let opened = open_response(&session, &jwe, session.expires_at - 1).expect("opens in time");
+    // A `now` at or past expiry on the split path is refused, exactly as
+    // process_response refuses it on the single-call path.
+    let err = process_opened_response(
+        &session,
+        opened,
+        session.expires_at,
+        &StaticKey(ec_jwk("ES256", "k")),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "policy");
+    assert!(err.to_string().contains("expired"), "{err}");
 }
