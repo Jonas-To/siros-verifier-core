@@ -932,6 +932,20 @@ pub fn process_response(
     resolver: &dyn IssuerKeyResolver,
 ) -> Result<Vec<PresentationResult>> {
     let opened = open_response(session, jwe, now)?;
+    process_opened_response(session, opened, now, resolver)
+}
+
+/// Process an already-opened response: the same checks [`process_response`]
+/// applies after decrypting, for hosts that opened the envelope once — on
+/// the blocking pool, under the same permit that bounds the rest of the
+/// verification — and need the opened value back for work of their own
+/// between the open and the verification.
+pub fn process_opened_response(
+    session: &Session,
+    opened: OpenedResponse,
+    now: i64,
+    resolver: &dyn IssuerKeyResolver,
+) -> Result<Vec<PresentationResult>> {
     let vp = &opened.vp_token;
 
     if session.dcql_query.get("credential_sets").is_some() {

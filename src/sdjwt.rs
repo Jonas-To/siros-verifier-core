@@ -269,15 +269,25 @@ pub fn select_jwks_key(jwks: &Value, kid: &str, alg: &str) -> Result<Jwk> {
 
 /// Peek the `(iss, kid, alg)` an SD-JWT's issuer-signed JWT names, without
 /// verifying anything: the host preloads exactly the issuer keys a response
-/// will need before handing the token to [`verify`]. The `iss` and `kid`
-/// are unverified hints — [`verify`] re-reads both from verified data, and
+/// will need before handing the token to [`verify`]. `Ok(None)` means
+/// nothing to preload: a token carrying an `x5c` header resolves through
+/// its own chain at verification — even a broken chain must fail THERE,
+/// not by fetching a JWKS the token never asked for — and a token with no
+/// `kid` has nothing for a JWKS lookup to match. The `iss` and `kid` are
+/// unverified hints — [`verify`] re-reads both from verified data, and
 /// [`IssuerJwksPreloaded`] misses on a mismatch rather than trusting them.
-pub fn issuer_key_hint(presentation: &str) -> Result<(String, Option<String>, String)> {
+pub fn issuer_key_hint(presentation: &str) -> Result<Option<(String, String, String)>> {
     if presentation.len() > MAX_INPUT {
         return Err(policy("presentation exceeds policy limit"));
     }
     let (jwt, ..) = split(presentation)?;
     let header = decode_header(jwt)?;
+    if header.x5c.is_some() {
+        return Ok(None);
+    }
+    let Some(kid) = header.kid.clone() else {
+        return Ok(None);
+    };
     let Some(payload) = jwt.split('.').nth(1) else {
         return Err(malformed("JWT has no payload"));
     };
@@ -287,7 +297,7 @@ pub fn issuer_key_hint(presentation: &str) -> Result<(String, Option<String>, St
         .and_then(Value::as_str)
         .ok_or_else(|| malformed("missing iss"))?
         .to_owned();
-    Ok((iss, header.kid.clone(), header.alg.clone()))
+    Ok(Some((iss, kid, header.alg.clone())))
 }
 
 pub fn x5c_chain(header: &JoseHeader) -> Result<Vec<Vec<u8>>> {

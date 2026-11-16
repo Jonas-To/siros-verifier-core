@@ -1,3 +1,4 @@
+use base64::Engine;
 use jose_rs::jwk::Jwk;
 use jose_rs::JoseHeader;
 use serde_json::{json, Value};
@@ -770,13 +771,13 @@ fn kid_profile_token_verifies_through_the_preloaded_jwks() {
 
     // The hint names exactly what the host must preload: the token's own
     // iss, the kid its header carries, and the alg the key must agree with.
-    let (iss, kid, alg) = issuer_key_hint(&p).unwrap();
+    let (iss, kid, alg) = issuer_key_hint(&p).unwrap().expect("a kid-profile hint");
     assert_eq!(iss, "https://issuer.example");
-    assert_eq!(kid.as_deref(), Some("iss-1"));
+    assert_eq!(kid, "iss-1");
     assert_eq!(alg, "ES256");
 
     let mut preloaded = IssuerJwksPreloaded::default();
-    preloaded.insert(&iss, kid.as_deref().unwrap(), public_of(&f.issuer));
+    preloaded.insert(&iss, &kid, public_of(&f.issuer));
     assert_eq!(preloaded.len(), 1);
 
     let v = verify(&p, &preloaded, &params("verifier", "n1")).unwrap();
@@ -831,4 +832,39 @@ fn preloaded_jwks_follow_the_tokens_carrier() {
         .resolve(&other_iss, "https://other.example")
         .unwrap_err();
     assert!(err.to_string().contains("no key for kid"), "{err}");
+}
+
+#[test]
+fn the_hint_skips_x5c_carriers() {
+    let f = fx();
+    // An x5c-carrying token never asks for a JWKS fetch, even with a kid set:
+    // its chain resolves at verification, and a broken chain must fail there.
+    let issued = issue(&f.issuer, &spec(&f)).unwrap();
+    let (header_b64, rest) = issued.jwt.split_once('.').unwrap();
+    let pad = |s: &str| format!("{s}{}", "=".repeat((4 - s.len() % 4) % 4));
+    let header = base64::engine::general_purpose::URL_SAFE
+        .decode(pad(header_b64).as_bytes())
+        .unwrap();
+    let mut with_chain: Value = serde_json::from_slice(&header).unwrap();
+    with_chain["x5c"] = json!(["bm90LWEtY2VydA"]);
+    let spliced = format!(
+        "{}.{rest}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&with_chain).unwrap())
+    );
+    let p = present(
+        &Issued {
+            jwt: spliced,
+            disclosures: issued.disclosures.clone(),
+        },
+        &[],
+        None,
+        HashAlg::Sha256,
+    )
+    .unwrap();
+    assert_eq!(
+        issuer_key_hint(&p).unwrap(),
+        None,
+        "an x5c carrier preloads nothing"
+    );
 }
