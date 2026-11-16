@@ -159,19 +159,13 @@ export class PresentationFlow {
     presetLabel.append(preset);
     form.append(presetLabel);
 
-    this.claims = document.createElement("label");
+    this.claims = document.createElement("fieldset");
     this.claims.className = "claim-options";
-    this.claims.textContent = "Requested attributes (select one or more)";
-    this.claimSelect = document.createElement("select");
-    this.claimSelect.name = "claims";
-    this.claimSelect.multiple = true;
-    this.claimSelect.addEventListener("change", () => {
-      const selected = Array.from(this.claimSelect.selectedOptions, (option) => option.value);
-      this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims ?? [], selected);
-      this.editor.value = JSON.stringify(this.currentDcql, null, 2);
-      this.setStatus("");
-    });
-    this.claims.append(this.claimSelect);
+    const claimsLegend = document.createElement("legend");
+    claimsLegend.textContent = "Requested attributes";
+    this.claims.append(claimsLegend);
+    this.claimsList = document.createElement("div");
+    this.claims.append(this.claimsList);
     form.append(this.claims);
 
     const editorLabel = document.createElement("label");
@@ -236,29 +230,50 @@ export class PresentationFlow {
     if (!preset) throw new RangeError("unknown preset");
     this.currentDcql = cloneDcql(preset.dcql);
     this.availableClaims = cloneDcql((preset.available_dcql ?? preset.dcql).credentials ?? []);
+    // Nothing is preselected: the operator checks the attributes to request.
+    // A claims-less credential query is a legal DCQL shape — present the
+    // credential with no claim constraints — so an empty start is valid and
+    // explicit rather than a preset's implicit "ask for everything".
+    this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims, []);
     this.editor.value = JSON.stringify(this.currentDcql, null, 2);
     this.renderClaims();
     this.setStatus("");
   }
 
   renderClaims() {
-    this.claimSelect.replaceChildren();
+    this.claimsList.replaceChildren();
     let count = 0;
     for (const [credentialIndex, credential] of (this.availableClaims ?? []).entries()) {
-      const group = document.createElement("optgroup");
-      group.label = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
+      const group = document.createElement("div");
+      group.className = "claim-group";
+      const heading = document.createElement("div");
+      heading.className = "claim-group-name";
+      heading.textContent = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
+      group.append(heading);
       for (const [claimIndex, claim] of (credential.claims ?? []).entries()) {
-        const option = document.createElement("option");
-        option.value = `${credentialIndex}:${claimIndex}`;
-        option.textContent = claimLabel(claim);
-        option.selected = claimSelected(this.currentDcql, credentialIndex, claim);
-        group.append(option);
+        const boxId = `claim-${credentialIndex}-${claimIndex}`;
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = `${credentialIndex}:${claimIndex}`;
+        box.id = boxId;
+        box.checked = claimSelected(this.currentDcql, credentialIndex, claim);
+        box.addEventListener("change", () => {
+          const selected = Array.from(this.claimsList.querySelectorAll("input:checked"), (el) => el.value);
+          this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims ?? [], selected);
+          this.editor.value = JSON.stringify(this.currentDcql, null, 2);
+          this.setStatus("");
+        });
+        const boxLabel = document.createElement("label");
+        boxLabel.htmlFor = boxId;
+        const boxText = document.createElement("span");
+        boxText.textContent = claimLabel(claim);
+        boxLabel.append(box, boxText);
+        group.append(boxLabel);
         count += 1;
       }
-      if (group.children.length) this.claimSelect.append(group);
+      this.claimsList.append(group);
     }
-    this.claimSelect.size = Math.min(6, Math.max(2, count));
-    this.claimSelect.disabled = count === 0;
+    this.claims.disabled = count === 0;
   }
 
   setStatus(text) {
