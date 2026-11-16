@@ -30,7 +30,7 @@ M = [
  ("sd", 'if iat > p.now + p.leeway_secs || iat < p.now - max_age_secs - p.leeway_secs {', 'if false {', "KB iat window"),
  ("sd", 'if kb_header.typ.as_deref() != Some("kb+jwt") {', 'if false {', "KB typ"),
  ("sd", 'if m.len() != 1 {', 'if false {', "array digest object extra members"),
- ("vp", 'if now >= session.expires_at {', 'if false {', "session expiry"),
+ ("vp", 'if now >= session.expires_at {', 'if false {', "session expiry", "all"),
  ("vp", 'if protected.kid.as_deref() != session.enc_key.kid.as_deref() {', 'if false {', "response kid"),
  ("vp", 'if body.get("state").and_then(Value::as_str) != Some(session.state.as_str()) {', 'if false {', "state"),
  ("vp", 'if find(id).is_none() {', 'if false {', "unrequested credential id"),
@@ -200,12 +200,18 @@ if base.returncode != 0:
     print("baseline tests fail; mutation results would be meaningless\n" + base.stdout[-2000:] + base.stderr[-2000:])
     sys.exit(2)
 survivors, missing = [], []
-for key, old, new, name in M:
+for t in M:
+    key, old, new, name = t[0], t[1], t[2], t[3]
     p = pathlib.Path(F[key]); orig = p.read_text()
     if old not in orig:
         missing.append(name); continue
     try:
-        p.write_text(orig.replace(old, new, 1))
+        # A mutant with scope "all" removes every copy of the check: a
+        # duplicated guard must not let the removal of any one copy pass
+        # unnoticed (the split open/verify pipeline guards the same
+        # expiry in two places, and mutating only the first would be
+        # masked by the second).
+        p.write_text(orig.replace(old, new) if len(t) > 4 and t[4] == "all" else orig.replace(old, new, 1))
         b = cargo(key, "--no-run")
         if b.returncode != 0:
             # a mutant that does not compile proves nothing; do not count it as killed
