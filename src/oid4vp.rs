@@ -939,13 +939,18 @@ pub fn process_response(
 /// applies after decrypting, for hosts that opened the envelope once — on
 /// the blocking pool, under the same permit that bounds the rest of the
 /// verification — and need the opened value back for work of their own
-/// between the open and the verification.
+/// between the open and the verification. The request-expiry guard runs
+/// again here so splitting the pipeline cannot outlive the request the
+/// same envelope answered.
 pub fn process_opened_response(
     session: &Session,
     opened: OpenedResponse,
     now: i64,
     resolver: &dyn IssuerKeyResolver,
 ) -> Result<Vec<PresentationResult>> {
+    if now >= session.expires_at {
+        return Err(policy("request has expired"));
+    }
     let vp = &opened.vp_token;
 
     if session.dcql_query.get("credential_sets").is_some() {

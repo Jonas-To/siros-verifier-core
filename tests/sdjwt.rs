@@ -868,3 +868,79 @@ fn the_hint_skips_x5c_carriers() {
         "an x5c carrier preloads nothing"
     );
 }
+
+#[test]
+fn symmetric_secrets_are_never_public_issuer_keys() {
+    let mut jwks = json!({ "keys": [] });
+    jwks["keys"].as_array_mut().unwrap().push(json!({
+        "kty": "oct", "k": "c2VjcmV0", "kid": "sym-1", "alg": "HS256", "use": "sig"
+    }));
+    let err = select_jwks_key(&jwks, "sym-1", "HS256").unwrap_err();
+    assert!(
+        err.to_string().contains("symmetric") || err.to_string().contains("private"),
+        "{err}"
+    );
+
+    let mut with_k = json!({ "keys": [] });
+    with_k["keys"].as_array_mut().unwrap().push(json!({
+        "kty": "EC", "crv": "P-256", "x": "AA", "y": "AA", "k": "c2VjcmV0", "kid": "k-1"
+    }));
+    assert!(
+        select_jwks_key(&with_k, "k-1", "ES256").is_err(),
+        "a k member is secret material"
+    );
+
+    // The resolver's own guard, for hosts that preload without the selector.
+    let mut preloaded = IssuerJwksPreloaded::default();
+    let mut secret = ec_jwk("ES256", "sym-2");
+    secret.k = Some("c2VjcmV0".to_owned());
+    preloaded.insert("https://issuer.example", "sym-2", secret);
+    let mut header = JoseHeader::new("ES256");
+    header.kid = Some("sym-2".to_owned());
+    let err = preloaded
+        .resolve(&header, "https://issuer.example")
+        .unwrap_err();
+    assert!(err.to_string().contains("private key material"), "{err}");
+}
+
+#[test]
+fn an_expired_session_is_refused_on_the_split_path_too() {
+    use jose_rs::algorithm::{JweAlgorithm, JweEncryption};
+    use siros_verifier_core::oid4vp::{open_response, process_opened_response, Session};
+
+    let mut enc_key = ec_jwk("ECDH-ES", "enc-1");
+    enc_key.use_ = Some("enc".to_owned());
+    let session = Session {
+        client_id: "x509_hash:test".to_owned(),
+        nonce: "n".to_owned(),
+        state: "s".to_owned(),
+        response_uri: "https://verifier.example/vp/response/x".to_owned(),
+        dcql_query: json!({"credentials": [{"id": "eudi_pid", "format": "dc+sd-jwt", "claims": []}]}),
+        expires_at: 1_800_000_000,
+        enc_key,
+        response_mode: "direct_post.jwt".to_owned(),
+        dc_api_origin: None,
+    };
+    let body = json!({"vp_token": {"eudi_pid": ["x"]}, "state": "s"});
+    let mut header = JoseHeader::for_jwe(JweAlgorithm::EcdhEs, JweEncryption::A128GCM);
+    header.kid = session.enc_key.kid.clone();
+    let jwe = siros_verifier_core::testutil::encrypt_response(
+        &session.enc_key.to_public_jwk(),
+        header,
+        body.to_string().as_bytes(),
+        JweEncryption::A128GCM,
+    )
+    .expect("jwe");
+    let opened = open_response(&session, &jwe, session.expires_at - 1).expect("opens in time");
+    // A `now` at or past expiry on the split path is refused, exactly as
+    // process_response refuses it on the single-call path.
+    let err = process_opened_response(
+        &session,
+        opened,
+        session.expires_at,
+        &StaticKey(ec_jwk("ES256", "k")),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "policy");
+    assert!(err.to_string().contains("expired"), "{err}");
+}

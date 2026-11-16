@@ -179,8 +179,10 @@ impl IssuerKeyResolver for IssuerJwksPreloaded {
         let Some(jwk) = self.keys.get(&(iss.to_owned(), kid.to_owned())) else {
             return Err(malformed(format!("issuer jwks has no key for kid {kid:?}")));
         };
-        if jwk.d.is_some() {
+        if jwk.d.is_some() || jwk.k.is_some() {
             // The host refuses private material at preload; defense in depth.
+            // `k` is the signing secret itself for a symmetric JWK — a
+            // public issuer key is never either.
             return Err(malformed("issuer jwks entry carries private key material"));
         }
         Ok(ResolvedKey {
@@ -257,8 +259,13 @@ pub fn select_jwks_key(jwks: &Value, kid: &str, alg: &str) -> Result<Jwk> {
                 )));
             }
         }
-        if key.get("d").is_some() {
+        if key.get("d").is_some() || key.get("k").is_some() {
+            // `k` is the signing secret itself for a symmetric (oct) JWK:
+            // a published secret signs for anyone who read the JWKS.
             return Err(malformed("issuer jwks key carries private key material"));
+        }
+        if key.get("kty").and_then(Value::as_str) == Some("oct") {
+            return Err(malformed("issuer jwks key is symmetric"));
         }
         let jwk: Jwk = serde_json::from_value(key.clone())
             .map_err(|e| malformed(format!("issuer jwks key for the kid is not a JWK: {e}")))?;
