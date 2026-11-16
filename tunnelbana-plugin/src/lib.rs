@@ -8,7 +8,7 @@
 //! Wallet traffic arrives out of band (the wallet POSTs to the proxy, not the browser), so flow results live in
 //! a server-side [`FlowStore`]. The browser only holds an opaque flow id in the sealed state cookie.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(feature = "http")]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use siros_verifier_core::oid4vp::{self, RequestConfig};
 use siros_verifier_core::receipt::{
     self, Cache, IssuePolicy, Lookup, PdpAnswer, TrustData, Verifier,
 };
-use siros_verifier_core::sdjwt::{CryptoVerified, X5cLeaf};
+use siros_verifier_core::sdjwt::CryptoVerified;
 use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core::status_list::{StatusListKeyResolver, StatusListKeySource};
 use siros_verifier_core::trust::TrustQuery;
@@ -638,6 +638,133 @@ impl PdpClient for HttpPdp {
         siros_verifier_core::json_strict::from_slice(&body)
             .map_err(|_| "pdp response is not json".into())
     }
+}
+
+/// Fetch the issuer keys a response's kid-profile SD-JWTs name: one
+/// `/.well-known/jwt-vc-issuer` discovery plus one JWKS fetch per unique
+/// `(iss, kid, alg)`, all https-only, size-bounded, redirect-free and
+/// public-internet-only, so an unverified `iss` can never steer the
+/// verifier into a private network. Every failure is logged and skipped:
+/// the preload only ever grows from successes, and a token whose key never
+/// arrived fails closed at resolution with the missing-key error.
+#[cfg(feature = "http")]
+async fn fetch_issuer_jwks(vp_token_text: &str) -> siros_verifier_core::sdjwt::IssuerJwksPreloaded {
+    use siros_verifier_core::sdjwt::IssuerJwksPreloaded;
+    use std::sync::OnceLock;
+
+    const ISSUER_METADATA_MAX_BYTES: usize = 16 * 1024;
+    const ISSUER_JWKS_MAX_BYTES: usize = 64 * 1024;
+
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .dns_resolver(Arc::new(PublicInternetResolver))
+            .build()
+            .expect("issuer jwks client builds")
+    });
+
+    let mut resolved = IssuerJwksPreloaded::default();
+    let Ok(vp) = serde_json::from_str::<serde_json::Value>(vp_token_text) else {
+        return resolved;
+    };
+    let Some(entries) = vp.as_object() else {
+        return resolved;
+    };
+    let mut hints: HashSet<(String, String, String)> = HashSet::new();
+    for value in entries.values() {
+        let Some(list) = value.as_array() else {
+            continue;
+        };
+        for presentation in list.iter().filter_map(|item| item.as_str()) {
+            // A peek that fails (an x5c-profile token, an mdoc DeviceResponse,
+            // a decoy) contributes nothing; the format layer re-decides per token.
+            if let Ok((iss, Some(kid), alg)) =
+                siros_verifier_core::sdjwt::issuer_key_hint(presentation)
+            {
+                hints.insert((iss, kid, alg));
+            }
+        }
+    }
+    for (iss, kid, alg) in hints {
+        match fetch_one_issuer_key(
+            client,
+            &iss,
+            &kid,
+            &alg,
+            ISSUER_METADATA_MAX_BYTES,
+            ISSUER_JWKS_MAX_BYTES,
+        )
+        .await
+        {
+            Ok(jwk) => resolved.insert(&iss, &kid, jwk),
+            Err(error) => {
+                tracing::warn!(iss = %iss, kid = %kid, %error, "issuer jwks resolution failed")
+            }
+        }
+    }
+    resolved
+}
+
+/// One issuer's key: discover `/.well-known/jwt-vc-issuer` under the token's
+/// own `iss` (the metadata must name the same issuer), then select the `kid`
+/// from the JWKS it points at. Both fetches are https-only, bounded and
+/// redirect-free; the selection re-validates the key against the profile's
+/// rules (exactly one match, `use`/`alg` agreement, no private material).
+#[cfg(feature = "http")]
+async fn fetch_one_issuer_key(
+    client: &reqwest::Client,
+    iss: &str,
+    kid: &str,
+    alg: &str,
+    metadata_max: usize,
+    jwks_max: usize,
+) -> std::result::Result<jose_rs::jwk::Jwk, String> {
+    // The iss is unverified token data: only an https origin with a host,
+    // no userinfo and no fragment is ever fetched.
+    let url = reqwest::Url::parse(iss).map_err(|_| "issuer is not a URL".to_owned())?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("issuer is not an allowed https URL".into());
+    }
+    let base = iss.trim_end_matches('/');
+    let metadata_url = format!("{base}/.well-known/jwt-vc-issuer");
+    let resp = client
+        .get(&metadata_url)
+        .send()
+        .await
+        .map_err(|e| format!("issuer metadata unreachable: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("issuer metadata http {}", resp.status().as_u16()));
+    }
+    let body = read_response_bounded(resp, metadata_max, "issuer metadata too large").await?;
+    let metadata: serde_json::Value = siros_verifier_core::json_strict::from_slice(&body)
+        .map_err(|_| "issuer metadata is not json".to_owned())?;
+    let (metadata_issuer, jwks_uri) =
+        siros_verifier_core::sdjwt::parse_jwt_vc_issuer_metadata(&metadata)
+            .map_err(|e| format!("issuer metadata: {e}"))?;
+    if metadata_issuer.trim_end_matches('/') != base {
+        return Err("issuer metadata names a different issuer".into());
+    }
+    let resp = client
+        .get(&jwks_uri)
+        .send()
+        .await
+        .map_err(|e| format!("issuer jwks unreachable: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("issuer jwks http {}", resp.status().as_u16()));
+    }
+    let body = read_response_bounded(resp, jwks_max, "issuer jwks too large").await?;
+    let jwks: serde_json::Value = siros_verifier_core::json_strict::from_slice(&body)
+        .map_err(|_| "issuer jwks is not json".to_owned())?;
+    siros_verifier_core::sdjwt::select_jwks_key(&jwks, kid, alg)
+        .map_err(|e| format!("issuer jwks: {e}"))
 }
 
 pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
@@ -1812,6 +1939,25 @@ impl VpBackend {
                 .on_zkp_response(&id, z, &session, &jwe, requester, now, timings)
                 .await;
         }
+        // The JWT-VC (non-HAIP) issuer profile: an SD-JWT whose header names
+        // its signing key by `kid` only, the key published in the issuer's
+        // JWKS (`/.well-known/jwt-vc-issuer` -> `jwks_uri`). The format layer
+        // stays sans-IO, so the keys are fetched here — once per response,
+        // in the async context — and handed to the verification as a
+        // preloaded resolver. The token's own carrier still decides: an x5c
+        // header never consults the preloaded keys, and a fetch failure
+        // preloads nothing, so a kid-profile token then fails closed with
+        // the missing-key error rather than skipping its verification.
+        // A peek that cannot open the envelope preloads nothing either: the
+        // verification below re-runs the same checks and reports the
+        // envelope error with the usual precedence.
+        #[cfg(feature = "http")]
+        let issuer_keys = match oid4vp::open_response(&session, &jwe, now) {
+            Ok(opened) => fetch_issuer_jwks(&opened.vp_token_text()).await,
+            Err(_) => siros_verifier_core::sdjwt::IssuerJwksPreloaded::default(),
+        };
+        #[cfg(not(feature = "http"))]
+        let issuer_keys = siros_verifier_core::sdjwt::IssuerJwksPreloaded::default();
         // Synchronous cryptographic verification runs on the blocking pool so
         // it cannot stall the async workers polling other requests. Its
         // permit moves into the job and is held until the job finishes —
@@ -1830,7 +1976,7 @@ impl VpBackend {
         };
         let verified = match tokio::task::spawn_blocking(move || {
             let _held = crypto_permit;
-            oid4vp::process_response(&session, &jwe, now, &X5cLeaf)
+            oid4vp::process_response(&session, &jwe, now, &issuer_keys)
         })
         .await
         {
