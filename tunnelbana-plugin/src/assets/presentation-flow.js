@@ -65,11 +65,15 @@ export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
   // Clear every configured claim first — including claims the available
   // catalog does not list (an incomplete catalog must never leave hidden
   // preset claims silently requested) — then re-enable exactly what the
-  // selection checked. Every credential keeps an explicit claims array:
-  // [] is the deliberate "only the mandatory claims" ask, and an absent
-  // member is the shape the verifier's DCQL validation rejects.
+  // selection checked. Every claim-bearing credential keeps an explicit
+  // claims array: [] is the deliberate "only the mandatory claims" ask,
+  // and an absent member is the shape the verifier's DCQL validation
+  // rejects. A zkp_req credential is left untouched: its query shape is
+  // `_req`, and a `claims` member makes profile matching fail.
   for (const credential of next.credentials ?? []) {
-    credential.claims = [];
+    if (credential.format !== "zkp_req" && ("claims" in credential || !("_req" in credential))) {
+      credential.claims = [];
+    }
   }
   const selected = new Set(selectedValues);
   for (const [credentialIndex, credential] of availableCredentials.entries()) {
@@ -148,6 +152,9 @@ export class PresentationFlow {
     this.dcApiAdapter = dcApiAdapter;
     this.pollMs = pollMs;
     this.runId = 0;
+    // A per-instance prefix so element IDs never collide across two flows
+    // on the same page: an explicit htmlFor must reach its own checkbox.
+    this.domId = `pf${Math.random().toString(36).slice(2, 10)}`;
     this.onResult = onResult;
     this.onError = onError;
     this.currentDcql = cloneDcql(presets[0].dcql);
@@ -264,7 +271,9 @@ export class PresentationFlow {
       heading.textContent = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
       group.append(heading);
       for (const [claimIndex, claim] of (credential.claims ?? []).entries()) {
-        const boxId = `claim-${credentialIndex}-${claimIndex}`;
+        // IDs are unique per flow instance: two flows on one page must
+        // never associate a label with the other flow's checkbox.
+        const boxId = `${this.domId}-claim-${credentialIndex}-${claimIndex}`;
         const box = document.createElement("input");
         box.type = "checkbox";
         box.value = `${credentialIndex}:${claimIndex}`;

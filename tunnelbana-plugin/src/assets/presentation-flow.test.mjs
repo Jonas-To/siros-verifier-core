@@ -311,3 +311,10 @@ test("an incomplete catalog never leaves hidden preset claims requested", () => 
   const onlyGiven = setSelectedClaims(preset, available, ["0:0"]);
   assert.deepEqual(onlyGiven.credentials[0].claims, [{path: ["given_name"]}]);
 });
+
+test("a zkp_req preset keeps its _req shape through the claim clearing", () => {
+  const preset = {credentials: [{id: "nym_attestation", format: "zkp_req", _req: [{fn_id: "pseudonym"}]}]};
+  const cleared = setSelectedClaims(preset, [{id: "nym_attestation", claims: []}], []);
+  assert.equal("claims" in cleared.credentials[0], false, "a zkp_req credential never gains a claims member");
+  assert.deepEqual(cleared.credentials[0]._req, [{fn_id: "pseudonym"}], "the _req shape is untouched");
+});
