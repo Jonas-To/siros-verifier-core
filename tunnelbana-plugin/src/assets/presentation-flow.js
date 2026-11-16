@@ -53,18 +53,31 @@ export function setClaimEnabled(dcql, credentialIndex, claim, enabled) {
   const index = claims.findIndex((candidate) => JSON.stringify(candidate.path) === JSON.stringify(claim.path));
   if (enabled && index < 0) claims.push(cloneDcql(claim));
   if (!enabled && index >= 0) claims.splice(index, 1);
-  if (claims.length) credential.claims = claims;
-  else delete credential.claims;
+  // An explicit empty array is the deliberate "only the mandatory claims"
+  // ask (OpenID4VP 1.0 §6.4.1) and the verifier's DCQL validation accepts
+  // it — an absent member is the rejected shape — so the member stays.
+  credential.claims = claims;
   return next;
 }
 
 export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
   let next = cloneDcql(dcql);
+  // Clear every configured claim first — including claims the available
+  // catalog does not list (an incomplete catalog must never leave hidden
+  // preset claims silently requested) — then re-enable exactly what the
+  // selection checked. Every credential keeps an explicit claims array:
+  // [] is the deliberate "only the mandatory claims" ask, and an absent
+  // member is the shape the verifier's DCQL validation rejects.
+  for (const credential of next.credentials ?? []) {
+    credential.claims = [];
+  }
   const selected = new Set(selectedValues);
   for (const [credentialIndex, credential] of availableCredentials.entries()) {
     for (const [claimIndex, claim] of (credential.claims ?? []).entries()) {
       if (!next.credentials?.[credentialIndex]) continue;
-      next = setClaimEnabled(next, credentialIndex, claim, selected.has(`${credentialIndex}:${claimIndex}`));
+      if (selected.has(`${credentialIndex}:${claimIndex}`)) {
+        next = setClaimEnabled(next, credentialIndex, claim, true);
+      }
     }
   }
   return next;
