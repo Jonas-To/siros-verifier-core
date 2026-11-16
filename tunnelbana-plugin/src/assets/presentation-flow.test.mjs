@@ -31,7 +31,10 @@ test("claim edits do not mutate the preset", () => {
   assert.equal(original.credentials[0].claims.length, 2);
   assert.deepEqual(next.credentials[0].claims, [{path: ["birthdate"]}]);
   const empty = setClaimEnabled(next, 0, birthdate, false);
-  assert.equal("claims" in empty.credentials[0], false);
+  // An explicit empty array: the deliberate "only the mandatory claims" ask
+  // (OpenID4VP 1.0 §6.4.1) — the verifier's DCQL validation rejects the
+  // absent member, so the member always stays.
+  assert.deepEqual(empty.credentials[0].claims, []);
   const restored = setClaimEnabled(empty, 0, birthdate, true);
   assert.equal(restored.credentials[0].claims.length, 1);
   const copy = cloneDcql(original);
@@ -242,4 +245,76 @@ test("direct links do not open the QR modal", () => {
     globalThis.document = previousDocument;
     globalThis.window = previousWindow;
   }
+});
+
+test("a preset starts with nothing preselected", () => {
+  const requested = {credentials: [{id: "eudi_pid", format: "dc+sd-jwt", claims: [{path: ["given_name"]}, {path: ["family_name"]}]}]};
+  const available = [{id: "eudi_pid", claims: [{path: ["given_name"]}, {path: ["family_name"]}]}];
+  const none = setSelectedClaims(requested, available, []);
+  assert.deepEqual(none.credentials[0].claims, [], "the preset's claims are not the selection, but the member stays explicit");
+});
+
+test("applyPreset clears the claims and renderClaims draws unchecked checkboxes", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const preset = {
+      label: "PID",
+      dcql: {credentials: [{id: "eudi_pid", format: "dc+sd-jwt", claims: [{path: ["given_name"]}, {path: ["family_name"]}]}]},
+    };
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.editor = new FakeElement("textarea");
+    flow.setStatus = () => {};
+    flow.presets = [preset];
+    flow.applyPreset(0);
+    assert.deepEqual(flow.currentDcql.credentials[0].claims, [], "nothing is preselected, the claims member stays explicit");
+    const group = flow.claimsList.children[0];
+    assert.equal(group.className, "claim-group");
+    assert.equal(group.children[0].textContent, "eudi_pid");
+    const boxes = group.children.slice(1);
+    assert.equal(boxes.length, 2, "one checkbox per available claim");
+    assert.ok(boxes.every((label) => label.children[0].checked === false), "all boxes start unchecked");
+    assert.equal(flow.claims.disabled, false, "claims exist, so the fieldset is enabled");
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("an empty claim list disables the fieldset", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.currentDcql = {credentials: []};
+    flow.availableClaims = [];
+    flow.renderClaims();
+    assert.equal(flow.claimsList.children.length, 0);
+    assert.equal(flow.claims.disabled, true);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("an incomplete catalog never leaves hidden preset claims requested", () => {
+  // The preset asks for given_name and birthdate; the available catalog
+  // lists only given_name. A selection that checks nothing must still
+  // clear birthdate — a stale catalog must never silently keep a hidden
+  // preset claim in the request.
+  const preset = {credentials: [{id: "eudi_pid", format: "dc+sd-jwt", claims: [{path: ["given_name"]}, {path: ["birthdate"]}]}]};
+  const available = [{id: "eudi_pid", claims: [{path: ["given_name"]}]}];
+  const none = setSelectedClaims(preset, available, []);
+  assert.deepEqual(none.credentials[0].claims, [], "the unlisted birthdate is cleared too");
+  const onlyGiven = setSelectedClaims(preset, available, ["0:0"]);
+  assert.deepEqual(onlyGiven.credentials[0].claims, [{path: ["given_name"]}]);
+});
+
+test("a zkp_req preset keeps its _req shape through the claim clearing", () => {
+  const preset = {credentials: [{id: "nym_attestation", format: "zkp_req", _req: [{fn_id: "pseudonym"}]}]};
+  const cleared = setSelectedClaims(preset, [{id: "nym_attestation", claims: []}], []);
+  assert.equal("claims" in cleared.credentials[0], false, "a zkp_req credential never gains a claims member");
+  assert.deepEqual(cleared.credentials[0]._req, [{fn_id: "pseudonym"}], "the _req shape is untouched");
 });

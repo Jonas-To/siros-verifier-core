@@ -53,18 +53,35 @@ export function setClaimEnabled(dcql, credentialIndex, claim, enabled) {
   const index = claims.findIndex((candidate) => JSON.stringify(candidate.path) === JSON.stringify(claim.path));
   if (enabled && index < 0) claims.push(cloneDcql(claim));
   if (!enabled && index >= 0) claims.splice(index, 1);
-  if (claims.length) credential.claims = claims;
-  else delete credential.claims;
+  // An explicit empty array is the deliberate "only the mandatory claims"
+  // ask (OpenID4VP 1.0 §6.4.1) and the verifier's DCQL validation accepts
+  // it — an absent member is the rejected shape — so the member stays.
+  credential.claims = claims;
   return next;
 }
 
 export function setSelectedClaims(dcql, availableCredentials, selectedValues) {
   let next = cloneDcql(dcql);
+  // Clear every configured claim first — including claims the available
+  // catalog does not list (an incomplete catalog must never leave hidden
+  // preset claims silently requested) — then re-enable exactly what the
+  // selection checked. Every claim-bearing credential keeps an explicit
+  // claims array: [] is the deliberate "only the mandatory claims" ask,
+  // and an absent member is the shape the verifier's DCQL validation
+  // rejects. A zkp_req credential is left untouched: its query shape is
+  // `_req`, and a `claims` member makes profile matching fail.
+  for (const credential of next.credentials ?? []) {
+    if (credential.format !== "zkp_req" && ("claims" in credential || !("_req" in credential))) {
+      credential.claims = [];
+    }
+  }
   const selected = new Set(selectedValues);
   for (const [credentialIndex, credential] of availableCredentials.entries()) {
     for (const [claimIndex, claim] of (credential.claims ?? []).entries()) {
       if (!next.credentials?.[credentialIndex]) continue;
-      next = setClaimEnabled(next, credentialIndex, claim, selected.has(`${credentialIndex}:${claimIndex}`));
+      if (selected.has(`${credentialIndex}:${claimIndex}`)) {
+        next = setClaimEnabled(next, credentialIndex, claim, true);
+      }
     }
   }
   return next;
@@ -135,6 +152,9 @@ export class PresentationFlow {
     this.dcApiAdapter = dcApiAdapter;
     this.pollMs = pollMs;
     this.runId = 0;
+    // A per-instance prefix so element IDs never collide across two flows
+    // on the same page: an explicit htmlFor must reach its own checkbox.
+    this.domId = `pf${Math.random().toString(36).slice(2, 10)}`;
     this.onResult = onResult;
     this.onError = onError;
     this.currentDcql = cloneDcql(presets[0].dcql);
@@ -159,19 +179,13 @@ export class PresentationFlow {
     presetLabel.append(preset);
     form.append(presetLabel);
 
-    this.claims = document.createElement("label");
+    this.claims = document.createElement("fieldset");
     this.claims.className = "claim-options";
-    this.claims.textContent = "Requested attributes (select one or more)";
-    this.claimSelect = document.createElement("select");
-    this.claimSelect.name = "claims";
-    this.claimSelect.multiple = true;
-    this.claimSelect.addEventListener("change", () => {
-      const selected = Array.from(this.claimSelect.selectedOptions, (option) => option.value);
-      this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims ?? [], selected);
-      this.editor.value = JSON.stringify(this.currentDcql, null, 2);
-      this.setStatus("");
-    });
-    this.claims.append(this.claimSelect);
+    const claimsLegend = document.createElement("legend");
+    claimsLegend.textContent = "Requested attributes";
+    this.claims.append(claimsLegend);
+    this.claimsList = document.createElement("div");
+    this.claims.append(this.claimsList);
     form.append(this.claims);
 
     const editorLabel = document.createElement("label");
@@ -236,29 +250,52 @@ export class PresentationFlow {
     if (!preset) throw new RangeError("unknown preset");
     this.currentDcql = cloneDcql(preset.dcql);
     this.availableClaims = cloneDcql((preset.available_dcql ?? preset.dcql).credentials ?? []);
+    // Nothing is preselected: the operator checks the attributes to request.
+    // A claims-less credential query is a legal DCQL shape — present the
+    // credential with no claim constraints — so an empty start is valid and
+    // explicit rather than a preset's implicit "ask for everything".
+    this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims, []);
     this.editor.value = JSON.stringify(this.currentDcql, null, 2);
     this.renderClaims();
     this.setStatus("");
   }
 
   renderClaims() {
-    this.claimSelect.replaceChildren();
+    this.claimsList.replaceChildren();
     let count = 0;
     for (const [credentialIndex, credential] of (this.availableClaims ?? []).entries()) {
-      const group = document.createElement("optgroup");
-      group.label = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
+      const group = document.createElement("div");
+      group.className = "claim-group";
+      const heading = document.createElement("div");
+      heading.className = "claim-group-name";
+      heading.textContent = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
+      group.append(heading);
       for (const [claimIndex, claim] of (credential.claims ?? []).entries()) {
-        const option = document.createElement("option");
-        option.value = `${credentialIndex}:${claimIndex}`;
-        option.textContent = claimLabel(claim);
-        option.selected = claimSelected(this.currentDcql, credentialIndex, claim);
-        group.append(option);
+        // IDs are unique per flow instance: two flows on one page must
+        // never associate a label with the other flow's checkbox.
+        const boxId = `${this.domId}-claim-${credentialIndex}-${claimIndex}`;
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.value = `${credentialIndex}:${claimIndex}`;
+        box.id = boxId;
+        box.checked = claimSelected(this.currentDcql, credentialIndex, claim);
+        box.addEventListener("change", () => {
+          const selected = Array.from(this.claimsList.querySelectorAll("input:checked"), (el) => el.value);
+          this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims ?? [], selected);
+          this.editor.value = JSON.stringify(this.currentDcql, null, 2);
+          this.setStatus("");
+        });
+        const boxLabel = document.createElement("label");
+        boxLabel.htmlFor = boxId;
+        const boxText = document.createElement("span");
+        boxText.textContent = claimLabel(claim);
+        boxLabel.append(box, boxText);
+        group.append(boxLabel);
         count += 1;
       }
-      if (group.children.length) this.claimSelect.append(group);
+      this.claimsList.append(group);
     }
-    this.claimSelect.size = Math.min(6, Math.max(2, count));
-    this.claimSelect.disabled = count === 0;
+    this.claims.disabled = count === 0;
   }
 
   setStatus(text) {
