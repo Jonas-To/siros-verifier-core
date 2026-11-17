@@ -290,7 +290,14 @@ export class PresentationFlow {
         if (!byParent.has(parentKey)) byParent.set(parentKey, []);
         byParent.get(parentKey).push([claimIndex, claim]);
       }
-      for (const [parentKey, entries] of byParent) {
+      // Top-level claims (the empty parent key) render first regardless of
+      // their position in the input: a nested claim before a top-level claim
+      // must never visually capture it under the nested heading. The named
+      // parents follow in first-appearance order.
+      const orderedParents = [...byParent.entries()].sort((a, b) =>
+        (a[0] === "" ? 0 : 1) - (b[0] === "" ? 0 : 1)
+      );
+      for (const [parentKey, entries] of orderedParents) {
         if (parentKey) {
           const parentHeading = document.createElement("div");
           parentHeading.className = "claim-parent-name";

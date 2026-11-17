@@ -422,3 +422,30 @@ test("mdoc namespaced claims group under the doctype path", () => {
     globalThis.document = previousDocument;
   }
 });
+
+test("top-level claims render before nested groups regardless of input order", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.currentDcql = {credentials: [{id: "vat"}]};
+    // A nested claim FIRST, then a top-level claim: the top-level one must
+    // not visually appear under the nested heading.
+    flow.availableClaims = [{id: "vat", claims: [
+      {path: ["issuer", "location_status"]},
+      {path: ["trust_anchor"]},
+      {path: ["administrative_unit", "name"]},
+    ]}];
+    flow.renderClaims();
+    const group = flow.claimsList.children[0];
+    // The first element must be the top-level claim (a label), not a
+    // claim-parent-name heading: the empty-parent group sorts first.
+    assert.equal(group.children[0].tagName, "label", "the top-level claim renders before the issuer heading");
+    const parents = group.children.filter((child) => child.className === "claim-parent-name");
+    assert.deepEqual(parents.map((p) => p.textContent), ["issuer", "administrative_unit"]);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
