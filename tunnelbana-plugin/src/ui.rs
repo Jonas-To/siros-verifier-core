@@ -295,7 +295,7 @@ impl Frontend for UiFrontend {
     }
 }
 
-pub(crate) fn page(title: &str, body: &str) -> String {
+pub fn page(title: &str, body: &str) -> String {
     let logo = BASE64.encode(include_bytes!("assets/siros-logo.png"));
     format!(
         r#"<!doctype html>
@@ -450,8 +450,9 @@ mod tests {
         assert!(html.contains("data:image/png;base64,"));
         assert!(html.contains("alt=\"SIROS Foundation\""));
         assert!(!html.contains("<footer"));
-        assert!(html.contains(".claim-group label"));
-        assert!(html.contains("input[type=\"checkbox\"]"));
+        // The claim picker's layout rules are pinned by the public-API
+        // suite (tests/ui.rs): a selector-name check here would pass even
+        // if the one-line layout bug returned.
         assert!(!html.contains("haip-vp"));
         assert!(!html.contains("navigator.credentials"));
     }
