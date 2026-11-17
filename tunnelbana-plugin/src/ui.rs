@@ -317,8 +317,13 @@ a.choice:hover,a.choice:focus {{ border-color:#1C4587; outline:none; }}
 .presentation-flow > label {{ display:block; margin:18px 0 8px; font-weight:600; }}
 .presentation-flow select,.presentation-flow textarea {{ box-sizing:border-box; width:100%; margin-top:6px; padding:10px; border:1px solid #aab5c5; border-radius:8px; background:inherit; color:inherit; font:inherit; }}
 .presentation-flow textarea {{ min-height:260px; font-family:ui-monospace,monospace; font-size:.88rem; }}
-.claim-options {{ display:block; margin:16px 0; }}
-.claim-options option::before {{ content:"☐ "; }} .claim-options option:checked::before {{ content:"☑ "; }}
+.claim-options {{ display:block; margin:16px 0; padding:12px 16px 16px; border:1px solid #aab5c5; border-radius:8px; }}
+.claim-options legend {{ padding:0 4px; font-weight:600; }}
+.claim-options:disabled {{ opacity:.6; }}
+.claim-group {{ margin-top:10px; }}
+.claim-group-name {{ font-weight:600; margin:6px 0 4px; }}
+.claim-group label {{ display:flex; align-items:center; gap:8px; margin:3px 0; cursor:pointer; }}
+.claim-group input[type="checkbox"] {{ margin:0; flex:none; accent-color:#1C4587; }}
 .flow-actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:20px; }}
 .flow-actions button {{ padding:11px 18px; border:1px solid #1C4587; border-radius:8px; background:#1C4587; color:white; cursor:pointer; }}
 .flow-actions button:nth-child(n+2) {{ background:transparent; color:#1C4587; }}
@@ -445,8 +450,8 @@ mod tests {
         assert!(html.contains("data:image/png;base64,"));
         assert!(html.contains("alt=\"SIROS Foundation\""));
         assert!(!html.contains("<footer"));
-        assert!(html.contains(".claim-options option::before"));
-        assert!(html.contains(".claim-options option:checked::before"));
+        assert!(html.contains(".claim-group label"));
+        assert!(html.contains("input[type=\"checkbox\"]"));
         assert!(!html.contains("haip-vp"));
         assert!(!html.contains("navigator.credentials"));
     }
