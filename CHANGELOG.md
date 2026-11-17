@@ -11,6 +11,12 @@ unreleased work.
 
 ## Published releases
 
+### 0.1.7 — 2026-11-18
+
+- **Source:** tag [`v0.1.7`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.7) → merge of #67. *Evidence appended after the tag's release workflow runs are green.*
+- **The delta over v0.1.6 — the demo-UI claim picker's readability, the second round of the drill's operator findings:**
+  - **#67:** the multi-select's UUID heading and the flat claim list. A single-credential preset no longer shows the raw DCQL query id (often a TS11 registry UUID — "can you explain why there is what looks like a uuid above the claims list?"). Nested claims group under their parent path segments — `['issuer','location_status']` under a muted "issuer" heading, `['given_name']` at the top level — matching the SUNET/vc demo's readability ("on SUNET/vc claims are grouped if they are part of sub-objects"). Top-level claims render before nested groups regardless of input order (a nested claim before a top-level claim must never visually capture it). The regression coverage lives in the public-API suite (`tunnelbana-plugin/tests/ui.rs`) and the JS test suite. Two Copilot rounds: the selector-name assertions replaced with layout-pinning coverage; the empty-parent group ordering fix.
+
 ### 0.1.6 — 2026-11-17
 
 - **Source:** tag [`v0.1.6`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.6) → commit [`03fd258`](https://github.com/sirosfoundation/siros-verifier-core/commit/03fd258e364f4553e39448e8326e09955b72b8a5) (merge of #66 — the workspace bump; the tree carries #65, the actix-http 3.21.3 advisory fixes), built from the locked dependency graph: pinned Git dependencies. **Signed tag, signature verified** (GPG, `Good signature from "Leif Johansson <leifj@mnt.se>" [ultimate]`; the tag object is `a6e3e284`).
