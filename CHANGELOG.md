@@ -11,6 +11,13 @@ unreleased work.
 
 ## Published releases
 
+### 0.1.6 — 2026-11-17
+
+- **Source:** tag [`v0.1.6`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.6) → merge of #65 (the workspace bump), built from the locked dependency graph: pinned Git dependencies. *The release-evidence block is appended after the tag's release workflow runs are green.*
+- **The delta over v0.1.5 — the demo-UI claim picker's vertical layout, found live in the WRPAC drill right after the v0.1.5 deploy:**
+  - **#65:** the #63 checkbox fieldset carried no layout rules, so its labels rendered as an **inline run — one unsorted line** instead of a vertical list (the operator: "selecting a different credential shows a list. However the list isn't vertical but unsorted linearly on one line"). The `claim-options` fieldset now has its layout: a bordered box with legend, per-credential group headings, **one checkbox label per line** (block-level flex row, the checkbox flexed to its natural width at the left, accented), the fieldset dimmed when a preset has no available claims. The old `select`/`option` pseudo-marker rules are gone. The regression coverage lives in the public-API suite (`tunnelbana-plugin/tests/ui.rs`), pinning the rendered stylesheet's rules — a `display:inline` label box fails the check; `ui::page` is `pub` for the suite. Two Copilot rounds: the selector-name assertions replaced with layout-pinning coverage, the test moved to the public-API suite.
+- **Maven Central carry-over:** the v0.1.5 Android AAR's Central mirror remains deferred to the Dec 1 quota reset (the `central-publish.yml` workflow re-publishes from the tag; the v0.1.6 AAR publishes to GitHub Packages in this release's own workflow the same way, with its Central mirror joining the same deferred queue).
+
 ### 0.1.5 — 2026-11-16
 
 - **Source:** tag [`v0.1.5`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.5) → commit [`ab66fa7`](https://github.com/sirosfoundation/siros-verifier-core/commit/ab66fa798d2fe5fa0e3baadb4b95162b894f3f3d) (merge of #64 — the workspace bump; the tree carries #62, #63, the mutation-script fix), built from the locked dependency graph: pinned Git dependencies. **Signed tag, signature verified** (GPG, `Good signature from "Leif Johansson <leifj@mnt.se>" [ultimate]`; the tag object is `560b6f58`).
