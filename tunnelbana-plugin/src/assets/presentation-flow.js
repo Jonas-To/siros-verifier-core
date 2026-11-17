@@ -263,35 +263,70 @@ export class PresentationFlow {
   renderClaims() {
     this.claimsList.replaceChildren();
     let count = 0;
+    const credentialCount = (this.availableClaims ?? []).length;
     for (const [credentialIndex, credential] of (this.availableClaims ?? []).entries()) {
       const group = document.createElement("div");
       group.className = "claim-group";
-      const heading = document.createElement("div");
-      heading.className = "claim-group-name";
-      heading.textContent = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
-      group.append(heading);
+      // The per-credential heading only when the picker carries more than
+      // one credential query — a single query's fieldset legend ("Requested
+      // attributes") suffices, and a raw query id (often a UUID) is noise
+      // the operator didn't ask to read.
+      if (credentialCount > 1) {
+        const heading = document.createElement("div");
+        heading.className = "claim-group-name";
+        heading.textContent = this.currentDcql.credentials?.[credentialIndex]?.id ?? credential.id ?? `Credential ${credentialIndex + 1}`;
+        group.append(heading);
+      }
+      // Nested claims group under their parent path segments:
+      // ["issuer","location_status"] sits under a sub-heading "issuer"
+      // with the label "location_status"; ["given_name"] stays at the
+      // section's top level. The parent path (all but the last segment)
+      // keys the sub-group, so deeper nesting stays distinct and ordered
+      // by first appearance.
+      const byParent = new Map();
       for (const [claimIndex, claim] of (credential.claims ?? []).entries()) {
-        // IDs are unique per flow instance: two flows on one page must
-        // never associate a label with the other flow's checkbox.
-        const boxId = `${this.domId}-claim-${credentialIndex}-${claimIndex}`;
-        const box = document.createElement("input");
-        box.type = "checkbox";
-        box.value = `${credentialIndex}:${claimIndex}`;
-        box.id = boxId;
-        box.checked = claimSelected(this.currentDcql, credentialIndex, claim);
-        box.addEventListener("change", () => {
-          const selected = Array.from(this.claimsList.querySelectorAll("input:checked"), (el) => el.value);
-          this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims ?? [], selected);
-          this.editor.value = JSON.stringify(this.currentDcql, null, 2);
-          this.setStatus("");
-        });
-        const boxLabel = document.createElement("label");
-        boxLabel.htmlFor = boxId;
-        const boxText = document.createElement("span");
-        boxText.textContent = claimLabel(claim);
-        boxLabel.append(box, boxText);
-        group.append(boxLabel);
-        count += 1;
+        const path = claim.path ?? [];
+        const parentKey = path.length > 1 ? path.slice(0, -1).join(" / ") : "";
+        if (!byParent.has(parentKey)) byParent.set(parentKey, []);
+        byParent.get(parentKey).push([claimIndex, claim]);
+      }
+      // Top-level claims (the empty parent key) render first regardless of
+      // their position in the input: a nested claim before a top-level claim
+      // must never visually capture it under the nested heading. The named
+      // parents follow in first-appearance order.
+      const orderedParents = [...byParent.entries()].sort((a, b) =>
+        (a[0] === "" ? 0 : 1) - (b[0] === "" ? 0 : 1)
+      );
+      for (const [parentKey, entries] of orderedParents) {
+        if (parentKey) {
+          const parentHeading = document.createElement("div");
+          parentHeading.className = "claim-parent-name";
+          parentHeading.textContent = parentKey;
+          group.append(parentHeading);
+        }
+        for (const [claimIndex, claim] of entries) {
+          // IDs are unique per flow instance: two flows on one page must
+          // never associate a label with the other flow's checkbox.
+          const boxId = `${this.domId}-claim-${credentialIndex}-${claimIndex}`;
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.value = `${credentialIndex}:${claimIndex}`;
+          box.id = boxId;
+          box.checked = claimSelected(this.currentDcql, credentialIndex, claim);
+          box.addEventListener("change", () => {
+            const selected = Array.from(this.claimsList.querySelectorAll("input:checked"), (el) => el.value);
+            this.currentDcql = setSelectedClaims(this.currentDcql, this.availableClaims ?? [], selected);
+            this.editor.value = JSON.stringify(this.currentDcql, null, 2);
+            this.setStatus("");
+          });
+          const boxLabel = document.createElement("label");
+          boxLabel.htmlFor = boxId;
+          const boxText = document.createElement("span");
+          boxText.textContent = claimLabel(claim);
+          boxLabel.append(box, boxText);
+          group.append(boxLabel);
+          count += 1;
+        }
       }
       this.claimsList.append(group);
     }

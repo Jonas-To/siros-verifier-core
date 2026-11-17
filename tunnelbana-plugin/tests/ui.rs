@@ -34,6 +34,14 @@ fn claim_labels_lay_out_vertically() {
         box_rule.contains("flex:none"),
         "the checkbox must not stretch with the row: {box_rule}"
     );
+    // Nested claims render under their parent path, distinguished by a
+    // smaller, muted heading — not a bold credential heading.
+    let parent_rule = style_rule(&css, ".claim-parent-name")
+        .unwrap_or_else(|| panic!("no claim-parent-name rule in the stylesheet"));
+    assert!(
+        parent_rule.contains("font-weight:500") && parent_rule.contains("font-size:.88em"),
+        "the parent heading is a muted sub-heading: {parent_rule}"
+    );
 }
 
 /// The stylesheet is the page's first <style> element.
