@@ -322,6 +322,7 @@ a.choice:hover,a.choice:focus {{ border-color:#1C4587; outline:none; }}
 .claim-options:disabled {{ opacity:.6; }}
 .claim-group {{ margin-top:10px; }}
 .claim-group-name {{ font-weight:600; margin:6px 0 4px; }}
+.claim-parent-name {{ font-weight:500; font-size:.88em; margin:10px 0 4px; color:#5a6a7a; }}
 .claim-group label {{ display:flex; align-items:center; gap:8px; margin:3px 0; cursor:pointer; }}
 .claim-group input[type="checkbox"] {{ margin:0; flex:none; accent-color:#1C4587; }}
 .flow-actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:20px; }}

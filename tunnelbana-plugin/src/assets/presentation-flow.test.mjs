@@ -272,8 +272,9 @@ test("applyPreset clears the claims and renderClaims draws unchecked checkboxes"
     assert.deepEqual(flow.currentDcql.credentials[0].claims, [], "nothing is preselected, the claims member stays explicit");
     const group = flow.claimsList.children[0];
     assert.equal(group.className, "claim-group");
-    assert.equal(group.children[0].textContent, "eudi_pid");
-    const boxes = group.children.slice(1);
+    // A single-credential preset shows no per-credential heading (the
+    // fieldset legend suffices), so every child is a checkbox label.
+    const boxes = group.children.filter((child) => child.tagName === "label");
     assert.equal(boxes.length, 2, "one checkbox per available claim");
     assert.ok(boxes.every((label) => label.children[0].checked === false), "all boxes start unchecked");
     assert.equal(flow.claims.disabled, false, "claims exist, so the fieldset is enabled");
@@ -317,4 +318,107 @@ test("a zkp_req preset keeps its _req shape through the claim clearing", () => {
   const cleared = setSelectedClaims(preset, [{id: "nym_attestation", claims: []}], []);
   assert.equal("claims" in cleared.credentials[0], false, "a zkp_req credential never gains a claims member");
   assert.deepEqual(cleared.credentials[0]._req, [{fn_id: "pseudonym"}], "the _req shape is untouched");
+});
+
+test("a single-credential preset shows no per-credential heading", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.editor = new FakeElement("textarea");
+    flow.setStatus = () => {};
+    flow.presets = [{label: "PID", dcql: {credentials: [{id: "eudi_pid", format: "dc+sd-jwt", claims: [{path: ["given_name"]}]}]}}];
+    flow.applyPreset(0);
+    const group = flow.claimsList.children[0];
+    // The only child with a heading class would be the claim-group-name:
+    // absent, because one credential means the fieldset legend suffices.
+    const headings = group.children.filter((child) => child.className === "claim-group-name");
+    assert.equal(headings.length, 0, "no per-credential heading for a single query");
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("a multi-credential preset shows per-credential headings", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.editor = new FakeElement("textarea");
+    flow.setStatus = () => {};
+    flow.currentDcql = {credentials: [{id: "pid"}, {id: "photo"}]};
+    flow.availableClaims = [
+      {id: "pid", claims: [{path: ["given_name"]}]},
+      {id: "photo", claims: [{path: ["portrait"]}]},
+    ];
+    flow.renderClaims();
+    const groups = flow.claimsList.children;
+    assert.equal(groups.length, 2);
+    const heading0 = groups[0].children[0];
+    const heading1 = groups[1].children[0];
+    assert.equal(heading0.className, "claim-group-name");
+    assert.equal(heading0.textContent, "pid");
+    assert.equal(heading1.textContent, "photo");
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("nested claims group under their parent path, top-level claims stay bare", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.currentDcql = {credentials: [{id: "vat"}]};
+    flow.availableClaims = [{id: "vat", claims: [
+      {path: ["name"]},
+      {path: ["trust_anchor"]},
+      {path: ["issuer", "location_status"]},
+      {path: ["issuer", "vat_id_authentic_source"]},
+      {path: ["administrative_unit", "name"]},
+      {path: ["administrative_unit", "vat_id"]},
+    ]}];
+    flow.renderClaims();
+    const group = flow.claimsList.children[0];
+    // First: the top-level claims (no parent heading)
+    const firstChild = group.children[0];
+    assert.equal(firstChild.tagName, "label", "top-level claims render before parent groups");
+    // Then: the "issuer" parent heading
+    const issuerHeading = group.children.find((child) => child.className === "claim-parent-name" && child.textContent === "issuer");
+    assert.ok(issuerHeading, "the issuer sub-heading exists");
+    const adminHeading = group.children.find((child) => child.className === "claim-parent-name" && child.textContent === "administrative_unit");
+    assert.ok(adminHeading, "the administrative_unit sub-heading exists");
+    // The parents appear in the order they first occur in the claim list
+    const parents = group.children.filter((child) => child.className === "claim-parent-name");
+    assert.deepEqual(parents.map((p) => p.textContent), ["issuer", "administrative_unit"]);
+  } finally {
+    globalThis.document = previousDocument;
+  }
+});
+
+test("mdoc namespaced claims group under the doctype path", () => {
+  const previousDocument = globalThis.document;
+  globalThis.document = {createElement: (tagName) => new FakeElement(tagName)};
+  try {
+    const flow = Object.create(PresentationFlow.prototype);
+    flow.claims = new FakeElement("fieldset");
+    flow.claimsList = new FakeElement("div");
+    flow.currentDcql = {credentials: [{id: "pid"}]};
+    flow.availableClaims = [{id: "pid", claims: [
+      {path: ["eu.europa.ec.eudi.pid.1", "given_name"]},
+      {path: ["eu.europa.ec.eudi.pid.1", "family_name"]},
+    ]}];
+    flow.renderClaims();
+    const group = flow.claimsList.children[0];
+    const parent = group.children.find((child) => child.className === "claim-parent-name");
+    assert.equal(parent.textContent, "eu.europa.ec.eudi.pid.1");
+  } finally {
+    globalThis.document = previousDocument;
+  }
 });
