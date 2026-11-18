@@ -344,6 +344,23 @@ async fn load_request_signing_pair(
     if chain_der.is_empty() {
         bail!("certificate chain {chain_path} is empty");
     }
+    // The key must be the chain leaf's key: a mismatched pair would pass
+    // every later init step and only surface as signatures no wallet can
+    // verify. Refuse it here, naming both paths — the same fail-fast
+    // posture the WRPRC validation has. The thumbprint covers the public
+    // members only, so the private JWK and the leaf's public JWK
+    // thumbprint identically when (and only when) they are the same key.
+    let key_thumbprint = jose_rs::jwk::thumbprint::thumbprint_sha256(&jwk)
+        .with_context(|| "thumbprinting the request signing key")?;
+    let leaf_jwk = siros_verifier_core::sdjwt::jwk_from_cert_der(&chain_der[0])
+        .with_context(|| "extracting the chain leaf's public key")?;
+    let leaf_thumbprint = jose_rs::jwk::thumbprint::thumbprint_sha256(&leaf_jwk)
+        .with_context(|| "thumbprinting the chain leaf")?;
+    if key_thumbprint != leaf_thumbprint {
+        bail!(
+            "the request signing key {key_path} does not match the certificate chain leaf in {chain_path} — a mismatched pair signs requests no wallet can verify"
+        );
+    }
     Ok((signer, chain_der, jwk))
 }
 
