@@ -143,6 +143,8 @@ previous_request_certificate_chain_path = "keys/old.chain"
 
 New flows always use the current pair. A stored flow is matched to its generation by its request object's `x5c` leaf, and re-signed by that pair; a flow whose generation matches nothing active is refused (its rotation window has passed). The window only needs to cover `request_ttl_secs`, so drop the previous pair from the config once every pre-rotation flow has expired.
 
+In a multi-replica deployment every replica must carry the same pair set through a rotation: first deploy the new current pair **with** the old pair retained to every replica, then after the retention window has passed on all of them, remove the retained pair everywhere. A replica without the retained pair refuses an in-flight pre-rotation flow's POST retrieval — the same coordination `previous_state_encryption_keys` already needs.
+
 The state-encryption key rotates the same way through `previous_state_encryption_keys` (retained for decryption only, never for sealing).
 
 ## UI presets
