@@ -8,14 +8,16 @@ use std::sync::Arc;
 use actix_web::{web, App, HttpServer};
 use anyhow::{anyhow, bail, Context as _};
 use grindvakt::provider::TokenUseStore;
-use siros_verifier_core::config::ClientRegistrationProvider;
 use siros_verifier_core::oid4vp;
 use siros_verifier_core::session_seal::SessionSealer;
 use siros_verifier_core_tunnelbana::{
     system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient,
     ReqwestStatusListClient, TrustGate, VpBackend,
 };
-use siros_verifier_service::config::{DeploymentConfig, FlowStorageConfig, ZkpDeploymentConfig};
+use siros_verifier_service::config::{
+    ConfigClientRegistration, DeploymentConfig, FlowStorageConfig, PlatformSecretProvider,
+    SecretProvider, ZkpDeploymentConfig,
+};
 use siros_verifier_service::http::{self, ReqwestClient};
 use siros_verifier_service::mongo_store::{MongoFlowStore, MongoTokenUseStore};
 use siros_verifier_zkp::backend::{BackendRegistry, ProofBackend, SystemProfile};
@@ -121,7 +123,22 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
         previous_secrets: cfg.previous_state_encryption_keys.clone(),
     };
 
-    let token_use_store = build_token_use_store(&cfg).await?;
+    // The platform secret provider — the boot's one selection point. The
+    // service constructs the default (both platform channels: env vars
+    // and files under the config directory); an alternative provider
+    // (a k8s API watch, a Vault client) replaces this construction and
+    // everything downstream resolves through the trait unchanged.
+    let secrets: Arc<dyn SecretProvider> =
+        Arc::new(PlatformSecretProvider::new(config_dir(config_path)));
+
+    // The one deployment config parse and secret resolution, shared by
+    // both stores: the flow store and the token-use store consume the
+    // same resolved storage settings, so a `uri_env`/`uri_file`
+    // reference reaches both, never just one (which would boot the
+    // other on the unresolved raw config and refuse a present secret).
+    let mut deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
+    resolve_deployment_secrets(&mut deployment, secrets.as_ref())?;
+    let token_use_store = build_token_use_store(&deployment.storage).await?;
     let mut frontends = Vec::new();
     for p in &cfg.frontends {
         let mut config = p.config_json();
@@ -138,14 +155,9 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
                 let raw = clients.as_array().cloned().ok_or_else(|| {
                     anyhow!("frontend {}: clients must be a list of tables", p.name)
                 })?;
-                let resolved = siros_verifier_core::config::ConfigClientRegistration::new(
-                    raw,
-                    std::sync::Arc::new(siros_verifier_core::config::PlatformSecretProvider::new(
-                        config_dir(config_path),
-                    )),
-                )
-                .clients()
-                .map_err(|e| anyhow!("frontend {}: {}", p.name, e.code()))?;
+                let resolved = ConfigClientRegistration::new(raw, secrets.clone())
+                    .clients()
+                    .map_err(|e| anyhow!("frontend {}: {}", p.name, e.code()))?;
                 config["clients"] = serde_json::Value::Array(resolved);
             }
         }
@@ -170,7 +182,7 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
         bail!("exactly one backend of type openid4vp is required");
     }
     let plugin = &cfg.backends[0];
-    let backend = build_openid4vp_backend(&cfg, plugin, config_path).await?;
+    let backend = build_openid4vp_backend(&cfg, plugin, config_path, deployment).await?;
     let backends = vec![backend];
     let mut microservices = Vec::new();
     for p in &cfg.microservices {
@@ -189,22 +201,16 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
 }
 
 async fn build_token_use_store(
-    cfg: &ProxyConfig,
+    storage: &FlowStorageConfig,
 ) -> anyhow::Result<Option<Arc<dyn TokenUseStore>>> {
-    if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
-        bail!("exactly one backend of type openid4vp is required");
-    }
-    let deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
-    match deployment.storage.backend.as_str() {
+    match storage.backend.as_str() {
         "memory" => Ok(None),
         "mongodb" => {
-            let uri = deployment
-                .storage
+            let uri = storage
                 .uri
                 .as_deref()
                 .ok_or_else(|| anyhow!("MongoDB storage requires uri"))?;
-            let database = deployment
-                .storage
+            let database = storage
                 .database
                 .as_deref()
                 .ok_or_else(|| anyhow!("MongoDB storage requires database"))?;
@@ -269,16 +275,14 @@ async fn build_flow_store(config: &FlowStorageConfig) -> anyhow::Result<Arc<dyn 
 /// cannot mistake a reference for a value.
 fn resolve_deployment_secrets(
     deployment: &mut DeploymentConfig,
-    config_dir: &std::path::Path,
+    secrets: &dyn SecretProvider,
 ) -> anyhow::Result<()> {
-    use siros_verifier_core::config::{resolve_secret_field, PlatformSecretProvider};
-    let provider = PlatformSecretProvider::new(config_dir);
     let resolve = |field: &str,
                    inline: Option<&str>,
                    env: Option<&str>,
                    file: Option<&str>|
      -> anyhow::Result<Option<String>> {
-        resolve_secret_field(field, inline, env, file, &provider)
+        siros_verifier_core::config::resolve_secret_field(field, inline, env, file, secrets)
             .map_err(|e| anyhow!("resolving {field}: {}", e.code()))
     };
     deployment.pdp_bearer_token = resolve(
@@ -385,9 +389,8 @@ async fn build_openid4vp_backend(
     cfg: &ProxyConfig,
     plugin: &tunnelbana_core::config::PluginConfig,
     config_path: &str,
+    mut deployment: DeploymentConfig,
 ) -> anyhow::Result<Box<dyn tunnelbana_core::plugin::Backend>> {
-    let mut deployment: DeploymentConfig = serde_json::from_value(plugin.config_json())?;
-    resolve_deployment_secrets(&mut deployment, &config_dir(config_path))?;
     // Startup-only reads, kept off the async runtime's worker threads.
     let (request_signer, chain_der, request_jwk) = load_request_signing_pair(
         config_path,

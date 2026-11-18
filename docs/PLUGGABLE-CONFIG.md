@@ -53,10 +53,19 @@ pub trait ClientRegistrationProvider: Send + Sync {
 | `PlatformSecretProvider` | both | a config mixing the two reference styles |
 | `ConfigClientRegistration` | config block + a secret provider | the default client roster |
 
+The **traits live in the sans-I/O core** (`siros_verifier_core::config` —
+`SecretProvider`, `SecretSource`, `ClientRegistrationProvider`,
+`resolve_secret_field`); the **concrete, operational implementations
+live in the service** (`siros_verifier_service::config`), per the crate's
+rule that transport, storage and key resolution belong to the host. The
+boot constructs the platform provider at **one selection point** and
+injects it into every resolution (the deployment fields, the client
+roster); an alternative provider (a k8s API watch, a Vault client)
+replaces that construction and everything downstream resolves through
+the trait unchanged.
+
 Anything a deployment platform can hand a process materializes into an
-env var or a file, so the two channels cover the common k8s models; a
-future provider (a direct k8s API watch, a Vault client) implements the
-same trait without touching the boot.
+env var or a file, so the two channels cover the common k8s models.
 
 ### Per-field explicit references
 
@@ -195,14 +204,18 @@ restart — the boot resolves fresh values.
 
 | Piece | Where |
 |---|---|
-| The traits + the three secret providers | `src/config/mod.rs` (`siros_verifier_core::config`) |
-| The default client roster (`_env` resolution) | `src/config/mod.rs` (`ConfigClientRegistration`) |
+| The traits + the pure field-resolution pattern | `src/config/mod.rs` (`siros_verifier_core::config`) |
+| The concrete providers (env, file, platform) + the default roster | `service/src/config.rs` (`siros_verifier_service::config`) |
 | The deployment fields (`_env`/`_file`, the previous pair) | `service/src/config.rs` |
-| Boot resolution (secrets, the previous pair, the roster) | `service/src/main.rs` |
+| Boot resolution (the provider selection point, both stores, the roster) | `service/src/main.rs` |
 | Generation-matched re-signing | `tunnelbana-plugin/src/lib.rs` (`with_previous_request_signers`) |
+| The rotation integration tests (public endpoints) | `tunnelbana-plugin/tests/request_rotation.rs` |
 | The user-facing reference | `docs/CONFIGURATION.md` — "Secrets and rotation" |
 
 The fail-fast rules are unit-tested at each layer: both sources for one
-value, a missing source, an empty source, a duplicate `client_id`, a
-previous chain that duplicates a leaf, and the generation matching for
-in-flight flows.
+value, a missing source, an empty source (env var and file alike), a
+duplicate `client_id`, a previous chain that duplicates a leaf, and an
+empty previous chain. The rotation is exercised through the public
+`start`/`request` endpoints across a simulated restart: the re-signed
+request object's `x5c` and signature are verified under the generation
+the flow was created with.
