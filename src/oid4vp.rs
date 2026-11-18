@@ -278,6 +278,26 @@ fn random_token() -> String {
     b64u(&b)
 }
 
+/// The leaf certificate of a request object's `x5c`, DER-encoded.
+///
+/// A verifier-signed request object always carries its chain (the reissue
+/// path overwrites `x5c` unconditionally, so a stored JAR missing one
+/// would be corrupt). Rotation matching uses the leaf to identify which
+/// signing-key generation a flow belongs to.
+pub fn request_object_chain_leaf(jar: &str) -> Result<Option<Vec<u8>>> {
+    let header =
+        jws::decode_header(jar).map_err(|e| malformed(format!("request object header: {e}")))?;
+    let Some(x5c) = header.x5c else {
+        return Ok(None);
+    };
+    let Some(leaf) = x5c.first() else {
+        return Ok(None);
+    };
+    B64.decode(leaf)
+        .map(Some)
+        .map_err(|e| malformed(format!("request object x5c leaf: {e}")))
+}
+
 /// Reissue a stored request object with the wallet's POSTed `wallet_nonce`.
 /// The signing key, encryption key, flow nonce, state, and response parameters
 /// remain those of the original flow; only `wallet_nonce` is added.

@@ -91,6 +91,60 @@ A deployment that fronts a relying party — an intermediary in ETSI TS 119 475'
 
 Both files are loaded and validated once at startup, and a failure refuses the boot rather than the first request: the WRPRC must parse (the shape per TS 119 475 §5.2, signature consistency under the presented chain, and freshness at the boot's clock — a future-dated or already-expired file refuses), and the dataset must carry the B.2 members (the RO-01..16 requirements). An unreadable path, a malformed file, or an inline `wrprc`/`verifier_info` member — the deployment config is path-only, and inline members are rejected loudly instead of being silently discarded — each refuse the boot. The arm re-validates the WRPRC's freshness on every request, so a certificate that expires while the service runs fails new flows at initiation with the `wrprc_expired` refusal instead of degrading silently. Rotating the certificate therefore means replacing the file and restarting the service; a running service keeps serving the members it booted with.
 
+## Secrets and rotation
+
+Secret-bearing deployment fields name their source explicitly: an inline value, an `_env` reference, or a `_file` reference — at most one, or the boot is refused (two sources named for one value is two different beliefs about where it comes from). Resolution happens once at boot and fails fast, naming the field and the variable or file involved.
+
+```toml
+[backend.config]
+# Inline (the default shape):
+pdp_bearer_token = "..."
+# Or from an environment variable — the platform-native channel; a k8s
+# Secret reaches the process through env.valueFrom.secretKeyRef:
+# pdp_bearer_token_env = "VC_PDP_TOKEN"
+# Or from a file — a Secret volume mount (relative paths resolve against
+# the config file's directory, like every other file member):
+# pdp_bearer_token_file = "secrets/pdp-token"
+
+[backend.config.storage]
+# The MongoDB URI carries credentials; the same three-source pattern:
+uri = "mongodb://..."          # or uri_env / uri_file
+database = "siros_verifier"
+```
+
+The same pattern applies to an OIDC frontend's client roster: a client's credential comes from an inline `client_secret` or a `client_secret_env` reference, resolved at boot and stripped before the strict client parser runs — so a typo'd field still fails the boot, and the platform owns the Secret.
+
+```toml
+[[frontend]]
+type = "oidc"
+name = "OIDC"
+  [frontend.config]
+  signing_key_path = "keys/op.key"
+  [[frontend.config.clients]]
+  client_id = "rp"
+  client_secret_env = "VC_RP_SECRET"     # resolved from the environment at boot
+  redirect_uris = ["https://rp.example.org/callback"]
+```
+
+The `${VAR}` interpolation the proxy config itself supports remains available everywhere; the `_env`/`_file` fields are the per-field pattern for secrets, with the stricter failure modes (an empty value is an error, and the error names the config entry and the source).
+
+### Request-signing key rotation
+
+Rotating the request-signing key (the WRPAC for an intermediary) keeps the previous pair for one rotation window so in-flight flows complete under the generation they started with — a re-signed request object (`request_uri_method = "post"`) must carry the same chain its `client_id` hashes from:
+
+```toml
+[backend.config]
+request_signing_key_path = "keys/new.key"             # signs every NEW flow
+request_certificate_chain_path = "keys/new.chain"
+# The prior pair, retained for in-flight flows; both paths together or neither:
+previous_request_signing_key_path = "keys/old.key"
+previous_request_certificate_chain_path = "keys/old.chain"
+```
+
+New flows always use the current pair. A stored flow is matched to its generation by its request object's `x5c` leaf, and re-signed by that pair; a flow whose generation matches nothing active is refused (its rotation window has passed). The window only needs to cover `request_ttl_secs`, so drop the previous pair from the config once every pre-rotation flow has expired.
+
+The state-encryption key rotates the same way through `previous_state_encryption_keys` (retained for decryption only, never for sealing).
+
 ## UI presets
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.

@@ -27,6 +27,16 @@ pub struct FlowStorageConfig {
     pub backend: String,
     #[serde(default)]
     pub uri: Option<String>,
+    /// The env var the MongoDB URI comes from (a k8s Secret's
+    /// `secretKeyRef`, a Fly secret). Mutually exclusive with `uri` and
+    /// `uri_file` — two sources named for one value is two different
+    /// beliefs about where it comes from.
+    #[serde(default)]
+    pub uri_env: Option<String>,
+    /// A file the MongoDB URI comes from (a Secret volume mount).
+    /// Mutually exclusive with `uri` and `uri_env`.
+    #[serde(default)]
+    pub uri_file: Option<String>,
     #[serde(default)]
     pub database: Option<String>,
     #[serde(default)]
@@ -43,6 +53,25 @@ pub struct DeploymentConfig {
     pub pdp_endpoint: String,
     #[serde(default)]
     pub pdp_bearer_token: Option<String>,
+    /// The env var the PDP bearer token comes from (a k8s Secret's
+    /// `secretKeyRef`, a Fly secret). Mutually exclusive with
+    /// `pdp_bearer_token` and `pdp_bearer_token_file`.
+    #[serde(default)]
+    pub pdp_bearer_token_env: Option<String>,
+    /// A file the PDP bearer token comes from (a Secret volume mount).
+    /// Mutually exclusive with `pdp_bearer_token` and
+    /// `pdp_bearer_token_env`.
+    #[serde(default)]
+    pub pdp_bearer_token_file: Option<String>,
+    /// The prior request-signing key, retained for one rotation window:
+    /// in-flight flows are re-signed (`request_uri_method = "post"`) by
+    /// the pair they were created under. New flows always use the
+    /// current key. Both this and its chain must be set together.
+    #[serde(default)]
+    pub previous_request_signing_key_path: Option<String>,
+    /// The prior request certificate chain, paired with the previous key.
+    #[serde(default)]
+    pub previous_request_certificate_chain_path: Option<String>,
     #[serde(default)]
     pub pdp_id: Option<String>,
     /// Explicitly permit plain HTTP to a non-loopback PDP on a trusted local

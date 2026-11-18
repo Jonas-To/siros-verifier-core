@@ -1015,6 +1015,13 @@ pub struct VpBackend {
     gate: TrustGate,
     signer: kryptering::SoftwareSigner,
     chain_der: Vec<Vec<u8>>,
+    /// Retained previous request-signing key/chain generations, most
+    /// recent rotation first. In-flight flows created before a rotation
+    /// are re-signed (`request_uri_method = "post"`) by the pair they
+    /// were created under — the re-issued request must carry the chain
+    /// its `client_id` hashes from. New flows always use the current
+    /// pair. The retention window is bounded by `request_ttl_secs`.
+    previous_signers: Vec<(kryptering::SoftwareSigner, Vec<Vec<u8>>)>,
     clock: Clock,
     status_list_client: Option<Arc<dyn StatusListClient>>,
     /// Optional `zkp_req` support. Each flow selects its format from its DCQL.
@@ -1419,6 +1426,7 @@ impl VpBackend {
             gate,
             signer,
             chain_der,
+            previous_signers: Vec::new(),
             clock,
             status_list_client: None,
             zkp: None,
@@ -1528,6 +1536,62 @@ impl VpBackend {
     pub fn with_status_list_client(mut self, client: Arc<dyn StatusListClient>) -> Self {
         self.status_list_client = Some(client);
         self
+    }
+
+    /// Retain previous request-signing key/chain generations for a rotation
+    /// window (most recent first). In-flight flows are re-signed by the pair
+    /// they were created under; new flows always use the current pair. Each
+    /// previous chain must be non-empty, and its leaf must differ from the
+    /// current leaf and every other previous leaf — matching a flow to its
+    /// generation is by leaf, so a duplicate would be ambiguous.
+    pub fn with_previous_request_signers(
+        mut self,
+        previous: Vec<(kryptering::SoftwareSigner, Vec<Vec<u8>>)>,
+    ) -> Result<Self> {
+        let current_leaf = self.chain_der.first();
+        let mut leaves: Vec<&Vec<u8>> = current_leaf.into_iter().collect();
+        for (i, (_, chain)) in previous.iter().enumerate() {
+            let leaf = chain.first().ok_or_else(|| {
+                Error::Config(format!(
+                    "previous request-signing key {i}: the certificate chain is empty"
+                ))
+            })?;
+            if leaves.contains(&leaf) {
+                return Err(Error::Config(format!(
+                    "previous request-signing key {i}: its chain leaf duplicates the current or an earlier previous chain — a flow could not be matched to one generation"
+                )));
+            }
+            leaves.push(leaf);
+        }
+        self.previous_signers = previous;
+        Ok(self)
+    }
+
+    /// The signing pair a stored flow's request object belongs to: the
+    /// generation whose chain leaf matches the stored JAR's `x5c` leaf.
+    /// A stored JAR this backend did not build carries no `x5c`; the
+    /// current pair re-signs it (and embeds the current chain), matching
+    /// the pre-rotation behavior.
+    fn signer_generation_for(
+        &self,
+        jar: &str,
+    ) -> Result<(&kryptering::SoftwareSigner, &[Vec<u8>])> {
+        let leaf =
+            oid4vp::request_object_chain_leaf(jar).map_err(|e| Error::BadRequest(e.to_string()))?;
+        let Some(leaf) = leaf else {
+            return Ok((&self.signer, &self.chain_der));
+        };
+        if self.chain_der.first().is_some_and(|der| *der == leaf) {
+            return Ok((&self.signer, &self.chain_der));
+        }
+        for (signer, chain) in &self.previous_signers {
+            if chain.first().is_some_and(|der| *der == leaf) {
+                return Ok((signer, chain));
+            }
+        }
+        Err(Error::BadRequest(
+            "the flow's request object matches no active request-signing key generation — its rotation window has passed".into(),
+        ))
     }
 
     fn flow_id_from_path(&self, ctx: &Context, prefix: &str) -> Result<String> {
@@ -2696,11 +2760,17 @@ impl Backend for VpBackend {
                         response.status = 400;
                         return Ok(BackendAction::Respond(response));
                     }
+                    // Rotation: re-sign by the generation the flow was
+                    // created under — the re-issued request must carry the
+                    // same chain its client_id hashes from, so a flow
+                    // created before a key rotation is completed with the
+                    // previous pair, not the current one.
+                    let (signer, chain) = self.signer_generation_for(&jar)?;
                     jar = oid4vp::reissue_request_with_wallet_nonce(
                         &jar,
                         &nonce.unwrap_or_default(),
-                        &self.signer,
-                        &self.chain_der,
+                        signer,
+                        chain,
                     )
                     .map_err(|e| Error::BadRequest(e.to_string()))?;
                 }
@@ -3002,5 +3072,234 @@ mod page_tests {
             r#"{"credentials":[{"id":"pid","format":"mso_mdoc"}]}"#,
         );
         assert!(request_profile(&request, &test_defaults()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod request_signer_rotation_tests {
+    use super::*;
+    use serde_json::json;
+    use siros_verifier_core::testutil;
+
+    fn test_defaults() -> VpBackendConfig {
+        serde_json::from_value(serde_json::json!({
+            "dcql": {"credentials": [{"id": "pid", "format": "dc+sd-jwt",
+                "meta": {"vct_values": ["urn:example:pid:1"]},
+                "claims": [{"path": ["credentialSubject", "given_name"]}]}]},
+            "attribute_map": {"givenname": "/given_name"},
+            "subject_pointer": "/family_name",
+            "role": "pid-provider"
+        }))
+        .unwrap()
+    }
+
+    /// One request-signing key generation: its chain (a self-signed leaf
+    /// stands in for the real WRPAC chain) and the JWK used to craft
+    /// stored request objects signed by it.
+    struct Generation {
+        chain: Vec<Vec<u8>>,
+        jwk: jose_rs::jwk::Jwk,
+    }
+
+    impl Generation {
+        /// A signer built from this generation's key — a distinct
+        /// instance from the same material; the backend holds its own
+        /// copy, so the comparison is by what they sign.
+        fn signer(&self) -> kryptering::SoftwareSigner {
+            siros_verifier_core::oid4vp::software_signer(&self.jwk)
+                .expect("the test key is a signable ES256 JWK")
+        }
+    }
+
+    fn generation(dns: &str) -> Generation {
+        let (der, jwk) = testutil::self_signed_ec(dns, "ES256");
+        Generation {
+            chain: vec![der],
+            jwk,
+        }
+    }
+
+    fn backend(
+        current: &Generation,
+        previous: Vec<(kryptering::SoftwareSigner, Vec<Vec<u8>>)>,
+    ) -> VpBackend {
+        let gate = TrustGate::new(
+            Arc::new(NoPdp),
+            p256::ecdsa::SigningKey::from_slice(&[0x42; 32]).expect("test scalar"),
+            "test-kid",
+            "test-issuer",
+            "test-audience",
+            "test-pdp",
+            300,
+        );
+        let built = VpBackend::new(
+            "vp",
+            "https://verifier.example/vp",
+            test_defaults(),
+            gate,
+            // The struct fields are moved out of the borrowed Generation
+            // wrappers, so clone the cheap parts.
+            current.signer(),
+            current.chain.clone(),
+            system_clock(),
+        )
+        .expect("the backend builds");
+        built
+            .with_previous_request_signers(previous)
+            .expect("the previous generations are valid")
+    }
+
+    /// A stored request object as this backend would have built it under
+    /// the given generation: ES256, the authz-req typ, the chain embedded.
+    fn stored_jar(gen: &Generation) -> String {
+        testutil::sign_raw(
+            &gen.jwk,
+            "oauth-authz-req+jwt",
+            &json!({
+                "aud": "https://verifier.example/vp",
+                "response_type": "vp_token",
+                "client_id": "x509_hash:test",
+                "nonce": "n",
+            }),
+            &gen.chain,
+        )
+    }
+
+    #[test]
+    fn a_flow_created_under_the_current_generation_re_signs_with_it() {
+        let current = generation("current.example");
+        let previous = generation("previous.example");
+        let b = backend(&current, vec![(previous.signer(), previous.chain.clone())]);
+        let jar = stored_jar(&current);
+        let (signer, _chain) = b
+            .signer_generation_for(&jar)
+            .expect("the current flow matches");
+        assert_signer_signs_the_same_way(signer, &current);
+    }
+
+    #[test]
+    fn a_flow_created_before_the_rotation_re_signs_with_the_previous_generation() {
+        let current = generation("current.example");
+        let previous = generation("previous.example");
+        let b = backend(&current, vec![(previous.signer(), previous.chain.clone())]);
+        let jar = stored_jar(&previous);
+        let (signer, chain) = b
+            .signer_generation_for(&jar)
+            .expect("the pre-rotation flow matches the retained generation");
+        assert_signer_signs_the_same_way(signer, &previous);
+        assert_eq!(chain, previous.chain.as_slice());
+    }
+
+    #[test]
+    fn a_flow_from_a_generation_outside_the_window_is_refused() {
+        let current = generation("current.example");
+        let retired = generation("retired.example");
+        let b = backend(&current, Vec::new());
+        let jar = stored_jar(&retired);
+        let err = match b.signer_generation_for(&jar) {
+            Ok(_) => panic!("a flow past the rotation window must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("rotation window"),
+            "the error names the window: {err}"
+        );
+    }
+
+    #[test]
+    fn a_stored_jar_without_a_chain_falls_back_to_the_current_generation() {
+        let current = generation("current.example");
+        let b = backend(&current, Vec::new());
+        // A bare JAR (no x5c) is not one this backend built; the fallback
+        // matches the pre-rotation behavior of always re-signing current.
+        let bare = testutil::sign_raw(
+            &current.jwk,
+            "oauth-authz-req+jwt",
+            &json!({"aud": "x"}),
+            &[],
+        );
+        let (_signer, chain) = b
+            .signer_generation_for(&bare)
+            .expect("the fallback applies");
+        assert_eq!(chain, current.chain.as_slice());
+    }
+
+    #[test]
+    fn a_previous_chain_whose_leaf_duplicates_the_current_is_refused() {
+        let current = generation("current.example");
+        let gate = TrustGate::new(
+            Arc::new(NoPdp),
+            p256::ecdsa::SigningKey::from_slice(&[0x42; 32]).expect("test scalar"),
+            "test-kid",
+            "test-issuer",
+            "test-audience",
+            "test-pdp",
+            300,
+        );
+        let built = VpBackend::new(
+            "vp",
+            "https://verifier.example/vp",
+            test_defaults(),
+            gate,
+            current.signer(),
+            current.chain.clone(),
+            system_clock(),
+        )
+        .expect("the backend builds");
+        let err = match built
+            .with_previous_request_signers(vec![(current.signer(), current.chain.clone())])
+        {
+            Ok(_) => panic!("a duplicate leaf must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("duplicates"),
+            "the error names the ambiguity: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_previous_chain_is_refused() {
+        let current = generation("current.example");
+        let gate = TrustGate::new(
+            Arc::new(NoPdp),
+            p256::ecdsa::SigningKey::from_slice(&[0x42; 32]).expect("test scalar"),
+            "test-kid",
+            "test-issuer",
+            "test-audience",
+            "test-pdp",
+            300,
+        );
+        let built = VpBackend::new(
+            "vp",
+            "https://verifier.example/vp",
+            test_defaults(),
+            gate,
+            current.signer(),
+            current.chain.clone(),
+            system_clock(),
+        )
+        .expect("the backend builds");
+        let other = generation("other.example");
+        let err = match built.with_previous_request_signers(vec![(other.signer(), Vec::new())]) {
+            Ok(_) => panic!("an empty previous chain must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("chain is empty"),
+            "the error names the empty chain: {err}"
+        );
+    }
+
+    /// Two signers built from the same JWK sign equal inputs to equal
+    /// outputs — the generation was selected by identity, not by chance.
+    fn assert_signer_signs_the_same_way(signer: &kryptering::SoftwareSigner, gen: &Generation) {
+        let payload = br#"{"proof":"generation"}"#;
+        let header = jose_rs::JoseHeader::new("ES256");
+        let selected = jose_rs::jws::compact::sign(signer, payload, &header)
+            .expect("the selected signer signs");
+        let expected = jose_rs::jws::compact::sign(&gen.signer(), payload, &header)
+            .expect("the generation's signer signs");
+        assert_eq!(selected, expected);
     }
 }
