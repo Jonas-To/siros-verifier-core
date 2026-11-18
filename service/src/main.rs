@@ -136,6 +136,12 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
     // same resolved storage settings, so a `uri_env`/`uri_file`
     // reference reaches both, never just one (which would boot the
     // other on the unresolved raw config and refuse a present secret).
+    // Validate the shape first: tunnelbana's parser defaults an omitted
+    // `[[backend]]` to an empty vector, and indexing it would panic —
+    // refuse with the operator-facing message instead.
+    if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
+        bail!("exactly one backend of type openid4vp is required");
+    }
     let mut deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
     resolve_deployment_secrets(&mut deployment, secrets.as_ref())?;
     let token_use_store = build_token_use_store(&deployment.storage).await?;
@@ -157,7 +163,7 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
                 })?;
                 let resolved = ConfigClientRegistration::new(raw, secrets.clone())
                     .clients()
-                    .map_err(|e| anyhow!("frontend {}: {}", p.name, e.code()))?;
+                    .map_err(|e| anyhow!("frontend {}: {} [{}]", p.name, e, e.code()))?;
                 config["clients"] = serde_json::Value::Array(resolved);
             }
         }
@@ -283,7 +289,7 @@ fn resolve_deployment_secrets(
                    file: Option<&str>|
      -> anyhow::Result<Option<String>> {
         siros_verifier_core::config::resolve_secret_field(field, inline, env, file, secrets)
-            .map_err(|e| anyhow!("resolving {field}: {}", e.code()))
+            .map_err(|e| anyhow!("resolving {field}: {} [{}]", e, e.code()))
     };
     deployment.pdp_bearer_token = resolve(
         "pdp_bearer_token",
