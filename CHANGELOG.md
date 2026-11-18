@@ -13,7 +13,11 @@ unreleased work.
 
 ### 0.1.7 — 2026-11-18
 
-- **Source:** tag [`v0.1.7`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.7) → merge of #67. *Evidence appended after the tag's release workflow runs are green.*
+- **Source:** tag [`v0.1.7`](https://github.com/sirosfoundation/siros-verifier-core/releases/tag/v0.1.7) → merge of #67 (the workspace bump), built from the locked dependency graph. **Signed tag, signature verified** (GPG, Good signature).
+- **Verifier image:** `ghcr.io/sirosfoundation/siros-verifier-core@sha256:8572a6dada0aa6288f2efd0d860f0d6f40b12e2f7e05a49441e2a4bb3100513f` — running as the dedicated non-root user `siros` (UID/GID 10001). Pull-by-digest verified.
+- **SBOMs — signed, both verified:** source and container CycloneDX; `cosign verify-blob` → `Verified OK` for both.
+- **Conformance — the seventh consecutive one-pass:** the tag-push run passed the OIDF verifier plan **14/14 modules, 0 failed, 0 skipped**. The certification ZIP and `verifier-summary.json` are on the release.
+- **Native artifacts:** Android AAR on GitHub Packages (the Central mirror deferred with v0.1.5/v0.1.6 to the Dec 1 quota reset); iOS xcframework with its SPM checksum and Swift bindings, on the release.
 - **The delta over v0.1.6 — the demo-UI claim picker's readability, the second round of the drill's operator findings:**
   - **#67:** the multi-select's UUID heading and the flat claim list. A single-credential preset no longer shows the raw DCQL query id (often a TS11 registry UUID — "can you explain why there is what looks like a uuid above the claims list?"). Nested claims group under their parent path segments — `['issuer','location_status']` under a muted "issuer" heading, `['given_name']` at the top level — matching the SUNET/vc demo's readability ("on SUNET/vc claims are grouped if they are part of sub-objects"). Top-level claims render before nested groups regardless of input order (a nested claim before a top-level claim must never visually capture it). The regression coverage lives in the public-API suite (`tunnelbana-plugin/tests/ui.rs`) and the JS test suite. Two Copilot rounds: the selector-name assertions replaced with layout-pinning coverage; the empty-parent group ordering fix.
 
