@@ -14,11 +14,7 @@ const GDC: &str = include_str!("../testdata/vc-layout/gdc.yaml");
 /// directory (its paths are absolute — the source dir is inert), the
 /// default policy switches.
 fn translate_gdc() -> siros_verifier_service::vc_layout::Translation {
-    // The gdc deployment speaks HTTP to its PDP on fly's private
-    // network — the explicit opt-in the translation demands.
-    let options = siros_verifier_service::vc_layout::TranslateOptions {
-        allow_insecure_pdp: true,
-    };
+    let options = full_gdc_options();
     let dir = std::path::Path::new("/etc/vc");
     siros_verifier_service::vc_layout::translate(GDC, dir, &options)
         .unwrap_or_else(|e| panic!("the gdc layout translates: {e:#}"))
@@ -30,6 +26,16 @@ fn translate_gdc_with(
 ) -> Result<siros_verifier_service::vc_layout::Translation, anyhow::Error> {
     let dir = std::path::Path::new("/etc/vc");
     siros_verifier_service::vc_layout::translate(GDC, dir, options)
+}
+
+/// The gdc deployment's full policy posture: HTTP to the PDP on fly's
+/// private network (the explicit opt-in) and the PAN as the OP's
+/// subject identifier.
+fn full_gdc_options() -> siros_verifier_service::vc_layout::TranslateOptions {
+    siros_verifier_service::vc_layout::TranslateOptions {
+        allow_insecure_pdp: true,
+        subject_pointer: Some("/personal_administrative_number".into()),
+    }
 }
 
 #[test]
@@ -249,7 +255,9 @@ fn a_plain_http_pdp_refuses_without_the_explicit_opt_in() {
     // internal-HTTP PDP needs the explicit opt-in, and with it the
     // emitted config states allow_insecure_http as loudly as the
     // native config would.
-    let err = match translate_gdc_with(&Default::default()) {
+    let mut options = full_gdc_options();
+    options.allow_insecure_pdp = false;
+    let err = match translate_gdc_with(&options) {
         Ok(_) => panic!("the gdc PDP is plain HTTP on a non-loopback address — refused"),
         Err(e) => e,
     };
@@ -257,9 +265,7 @@ fn a_plain_http_pdp_refuses_without_the_explicit_opt_in() {
         err.to_string().contains("--allow-insecure-pdp"),
         "the refusal names the opt-in: {err:#}"
     );
-    let allowed = siros_verifier_service::vc_layout::TranslateOptions {
-        allow_insecure_pdp: true,
-    };
+    let allowed = full_gdc_options();
     let translation = translate_gdc_with(&allowed).expect("the opt-in permits it");
     let doc: toml::Table =
         toml::from_str(&translation.toml).expect("the emitted proxy.toml parses as TOML");
@@ -280,9 +286,7 @@ fn a_typo_under_a_dynamic_key_refuses_the_translation() {
     // preset matches no member pattern and refuses, rather than passing
     // as a mapped subtree and silently dropping the claims.
     let source = GDC.replacen("          claims:\n", "          cliams:\n", 1);
-    let options = siros_verifier_service::vc_layout::TranslateOptions {
-        allow_insecure_pdp: true,
-    };
+    let options = full_gdc_options();
     let err = match siros_verifier_service::vc_layout::translate(
         &source,
         std::path::Path::new("/etc/vc"),
@@ -307,9 +311,7 @@ fn a_mixed_preset_refuses_the_translation() {
         "  nym_auth_pseudonym_age:\n    credentials:\n      pid_eudi:\n        format: dc+sd-jwt\n      accredify_individual_id:\n        format: ldp_vc\n",
         1,
     );
-    let options = siros_verifier_service::vc_layout::TranslateOptions {
-        allow_insecure_pdp: true,
-    };
+    let options = full_gdc_options();
     let err = match siros_verifier_service::vc_layout::translate(
         &source,
         std::path::Path::new("/etc/vc"),
@@ -402,6 +404,11 @@ async fn the_translated_layout_boots_the_service_healthy() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_siros-verifier-service"))
         .arg("--from-vc-layout")
         .arg(&layout_path)
+        // The fixture carries an OP: the explicit subject mapping the
+        // translation demands (the given_name claim is the fixture's
+        // unique-enough identifier).
+        .arg("--subject-pointer")
+        .arg("/given_name")
         .env("TUNNELBANA_BIND", address.to_string())
         .env(
             "SIROS_VERIFIER_STATE_KEY",

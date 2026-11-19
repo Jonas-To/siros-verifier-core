@@ -5013,6 +5013,7 @@ dependencies = [
  "tracing-subscriber",
  "tunnelbana-core",
  "tunnelbana-plugins",
+ "url",
  "zstd",
 ]
 

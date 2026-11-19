@@ -365,7 +365,6 @@ const MAPPED: &[&str] = &[
     "verifier.inbound.openid4vp.token_endpoint",
     "verifier.inbound.openid4vp.supported_credentials.scopes",
     "verifier.inbound.openid4vp.supported_credentials.vct",
-    "verifier.inbound.openid4vp.clients.*.client_id",
     "verifier.inbound.openid4vp.clients.*.client_id_env",
     "verifier.inbound.openid4vp.clients.*.client_secret",
     "verifier.inbound.openid4vp.clients.*.client_secret_env",
@@ -409,9 +408,7 @@ const MAPPED: &[&str] = &[
     "common.credential_registry.refresh_interval",
     "common.credential_metadata.*.doctype",
     "common.credential_metadata.*.format",
-    "common.credential_metadata.*.mddl_file_path",
     "common.credential_metadata.*.vct",
-    "common.credential_metadata.*.vctm_file_path",
 ];
 
 /// Recognized vc-stack members with no siros-verifier-core equivalent:
@@ -457,6 +454,8 @@ const KNOWN_UNSUPPORTED: &[(&str, &str)] = &[
     ("common.jsonld_contexts", "JSON-LD context resolution (ldp_vc support)"),
     ("common.branding", "branding assets (this service's UI ships its own)"),
     ("common.credential_metadata.*.credential_contexts", "ldp_vc context documents"),
+    ("common.credential_metadata.*.mddl_file_path", "the mdoc metadata description list — no local metadata source in this service (the doctype rides the query meta)"),
+    ("common.credential_metadata.*.vctm_file_path", "the vctm context document — no local metadata source in this service"),
     ("common.credential_metadata.*.credential_type_values", "ldp_vc type values"),
     ("common.credential_metadata.*.credential_types", "ldp_vc type names"),
 ];
@@ -609,6 +608,13 @@ pub struct TranslateOptions {
     /// refuses the URL and names the switch, rather than silently
     /// relaxing the transport policy.
     pub allow_insecure_pdp: bool,
+    /// The claim the OIDC subject derives from. REQUIRED when the vc
+    /// layout enables the OP (`outbound.oidc_provider`): a holder's
+    /// name is not a unique identifier (two holders sharing a family
+    /// name would share a subject), so the adapter refuses the OP
+    /// without an explicit mapping. Absent an OP, the backend's own
+    /// subject pointer defaults to the common PID family_name.
+    pub subject_pointer: Option<String>,
 }
 
 impl std::fmt::Display for Report {
@@ -704,7 +710,7 @@ fn emit(
     emit_logging(cfg, &mut root);
     let mut frontends: Vec<toml::Value> = Vec::new();
     frontends.push(toml::Value::Table(emit_ui_frontend(cfg, report)?));
-    if let Some(oidc) = emit_oidc_frontend(cfg, report, context) {
+    if let Some(oidc) = emit_oidc_frontend(cfg, report, context)? {
         frontends.push(toml::Value::Table(oidc));
     }
     root.insert("frontend".into(), toml::Value::Array(frontends));
@@ -854,13 +860,12 @@ fn emit_registry(cfg: &VcConfig, ui_config: &mut toml::Table) {
     };
     let endpoint = format!("{}/api/v1/schemas.json", mirror.trim_end_matches('/'));
     ui_config.insert("registry_url".into(), toml::Value::String(endpoint.clone()));
-    let host = mirror
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    // The allowed host is the URL's host (no port, no path — the
+    // registry compares against Url::host_str()).
+    let host = url::Url::parse(&mirror)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
     ui_config.insert(
         "registry_allowed_hosts".into(),
         toml::Value::Array(vec![toml::Value::String(host)]),
@@ -885,7 +890,7 @@ fn emit_presets(cfg: &VcConfig, report: &mut Report) -> Result<Vec<toml::Value>>
         let mut credentials: Vec<toml::Value> = Vec::new();
         let mut unsupported: Vec<String> = Vec::new();
         for (scope, credential) in &preset.credentials {
-            match credential_dcql(scope, credential, cfg) {
+            match credential_dcql(scope, credential, cfg)? {
                 Some(query) => credentials.push(toml::Value::Table(query)),
                 None => unsupported.push(scope.clone()),
             }
@@ -932,8 +937,20 @@ fn emit_oidc_frontend(
     cfg: &VcConfig,
     report: &mut Report,
     context: &TranslateContext,
-) -> Option<toml::Table> {
-    let oidc = cfg.verifier.outbound.oidc_provider.as_ref()?;
+) -> Result<Option<toml::Table>> {
+    let Some(oidc) = cfg.verifier.outbound.oidc_provider.as_ref() else {
+        return Ok(None);
+    };
+    // A holder's name is not a unique identifier: the OP demands an
+    // explicit subject mapping (--subject-pointer).
+    let subject_pointer = context.options.subject_pointer.as_deref().ok_or_else(|| {
+        anyhow!(
+            "verifier.outbound.oidc_provider is enabled but the vc layout names no subject member — pass --subject-pointer with a UNIQUE identifier claim (two holders sharing a name would share a subject)"
+        )
+    })?;
+    report.mapped(format!(
+        "--subject-pointer {subject_pointer} -> the OP's subject identifier"
+    ));
     let mut fe = toml::Table::new();
     fe.insert("type".into(), toml::Value::String("oidc".into()));
     fe.insert("name".into(), toml::Value::String("OIDC".into()));
@@ -979,7 +996,7 @@ fn emit_oidc_frontend(
         config.insert("clients".into(), toml::Value::Array(clients));
     }
     fe.insert("config".into(), toml::Value::Table(config));
-    Some(fe)
+    Ok(Some(fe))
 }
 
 /// The client roster: the vc clients map (keyed by client id) becomes
@@ -1127,13 +1144,21 @@ fn emit_backend(
         .and_then(|o| o.presentation_timeout)
         .unwrap_or(300);
     bconfig.insert("request_ttl_secs".into(), toml::Value::Integer(timeout));
-    // The vc layout has no subject-pointer member; the common PID
-    // family name is the working default, and the report says so.
+    // The vc layout has no subject-pointer member. An explicit mapping
+    // wins; without one, the common PID family_name is the default —
+    // UNLESS the OP rides (emit_oidc_frontend refuses that).
+    let subject_pointer = context
+        .options
+        .subject_pointer
+        .clone()
+        .unwrap_or_else(|| "/family_name".to_string());
     bconfig.insert(
         "subject_pointer".into(),
-        toml::Value::String("/family_name".into()),
+        toml::Value::String(subject_pointer),
     );
-    report.note("backend.config.subject_pointer = \"/family_name\" — the vc layout has no subject member; adjust to the deployment's subject claim");
+    if context.options.subject_pointer.is_none() {
+        report.note("backend.config.subject_pointer defaults to /family_name — pass --subject-pointer to map the deployment's subject claim");
+    }
     bconfig.insert(
         "dcql".into(),
         toml::Value::Table(emit_fallback_dcql(cfg, report)),
@@ -1261,12 +1286,16 @@ fn credential_dcql(
     scope: &str,
     credential: &VcPresetCredential,
     cfg: &VcConfig,
-) -> Option<toml::Table> {
+) -> Result<Option<toml::Table>> {
     let meta = cfg.common.credential_metadata.get(scope);
-    let format = credential
+    let format = match credential
         .format
         .as_deref()
-        .or(meta.and_then(|m| m.format.as_deref()))?;
+        .or(meta.and_then(|m| m.format.as_deref()))
+    {
+        Some(format) => format,
+        None => return Ok(None),
+    };
     let mut q = toml::Table::new();
     q.insert("id".into(), scope.to_string().into());
     match format {
@@ -1349,29 +1378,30 @@ fn credential_dcql(
                     .into(),
             );
             q.insert("meta".into(), m.into());
-            let reqs: Vec<toml::Value> = credential
-                .req
-                .iter()
-                .filter_map(|r| {
-                    let fn_id = r.fn_id.as_deref()?;
-                    let mut entry = toml::Table::new();
-                    entry.insert("fn_id".into(), fn_id.into());
-                    if let Some(ret) = r.return_.as_deref() {
-                        entry.insert("return".into(), ret.into());
+            // An incomplete request function (no fn_id) is a lost
+            // requirement, not a filterable entry — refuse it.
+            let mut reqs: Vec<toml::Value> = Vec::with_capacity(credential.req.len());
+            for r in &credential.req {
+                let fn_id = r.fn_id.as_deref().ok_or_else(|| {
+                    anyhow!("preset credential '{scope}': a req entry has no fn_id")
+                })?;
+                let mut entry = toml::Table::new();
+                entry.insert("fn_id".into(), fn_id.into());
+                if let Some(ret) = r.return_.as_deref() {
+                    entry.insert("return".into(), ret.into());
+                }
+                if let Some(params) = r.params.as_ref() {
+                    if let Ok(value) = json_to_toml(params) {
+                        entry.insert("params".into(), value);
                     }
-                    if let Some(params) = r.params.as_ref() {
-                        if let Ok(value) = json_to_toml(params) {
-                            entry.insert("params".into(), value);
-                        }
-                    }
-                    Some(toml::Value::Table(entry))
-                })
-                .collect();
+                }
+                reqs.push(toml::Value::Table(entry));
+            }
             q.insert("_req".into(), reqs.into());
         }
-        _ => return None,
+        _ => return Ok(None),
     }
-    Some(q)
+    Ok(Some(q))
 }
 
 /// The zkp block from the vc nym_auth circuits: the allowlist maps
@@ -1474,7 +1504,7 @@ fn zkp_queries_from_presets(cfg: &VcConfig) -> Vec<toml::Table> {
     let mut queries: Vec<toml::Table> = Vec::new();
     for preset in cfg.verifier.presets.values() {
         for (scope, credential) in &preset.credentials {
-            if let Some(q) = credential_dcql(scope, credential, cfg) {
+            if let Some(q) = credential_dcql(scope, credential, cfg).ok().flatten() {
                 if q.get("format").and_then(|f| f.as_str()) == Some("zkp_req")
                     && !queries.iter().any(|existing| existing == &q)
                 {
@@ -1571,12 +1601,19 @@ fn member_value(oidc: &VcOidcOp, member: &str) -> Option<toml::Value> {
 
 /// Whether a URL's host is a loopback address (the only plain-HTTP PDP
 /// the native config permits without the escape hatch).
-fn is_loopback_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw) else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or_default();
-    host == "127.0.0.1" || host == "localhost" || host == "[::1]"
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// Parse the vc layout's duration strings ("10s", "1h") to seconds.

@@ -670,11 +670,28 @@ fn vc_layout_boot(
 ) -> anyhow::Result<Option<(String, std::path::PathBuf, Option<String>)>> {
     let yaml = std::fs::read_to_string(source)
         .with_context(|| format!("reading the vc layout {source}"))?;
-    let source_dir = std::path::Path::new(source)
+    // Absolute before the translator sees it: a relative source path
+    // (deploy/config.yaml) must not yield a relative directory the
+    // backend would then resolve beneath the temp copy.
+    let source_abs = if std::path::Path::new(source).is_absolute() {
+        source.to_string()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(source).to_string_lossy().into_owned())
+            .unwrap_or_else(|_| source.to_string())
+    };
+    let source_dir = std::path::Path::new(&source_abs)
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let options = siros_verifier_service::vc_layout::TranslateOptions { allow_insecure_pdp };
+    let subject_pointer = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find_map(|w| (w[0] == "--subject-pointer").then(|| w[1].clone()));
+    let options = siros_verifier_service::vc_layout::TranslateOptions {
+        allow_insecure_pdp,
+        subject_pointer,
+    };
     let translation = siros_verifier_service::vc_layout::translate(&yaml, &source_dir, &options)
         .with_context(|| format!("translating the vc layout {source}"))?;
     eprintln!(

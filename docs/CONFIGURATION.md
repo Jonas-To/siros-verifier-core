@@ -157,6 +157,8 @@ siros-verifier-service --from-vc-layout /etc/vc/config.yaml
 
 The adapter translates that layout into this service's proxy.toml at boot (or with `--emit-toml <path>`, writes it — owner-only mode — for inspection and exits). Relative file members resolve against the source yaml's own directory, so the emitted config is location-independent; the state secret reads the same `SIROS_VERIFIER_STATE_KEY` env var the deploy tooling already sets, and the vc `api_server.addr` becomes the service's bind (an explicit `TUNNELBANA_BIND` wins). A plain-HTTP PDP on a non-loopback address — the vc layouts' private-network posture — needs the explicit `--allow-insecure-pdp` opt-in; without it the translation refuses and names the flag.
 
+When the layout enables the OP (`verifier.outbound.oidc_provider`), the translation also demands `--subject-pointer <claim-path>` — a **unique** identifier claim for the OIDC subject. A holder's name is not one: two holders sharing a family name would share a subject, so the adapter never silently defaults the OP's subject. Without an OP, the backend's own subject pointer defaults to the PID `family_name` (the report says so).
+
 Every member of the source document lands in one of three buckets, and the translation prints the report:
 
 - **mapped** — translated to its equivalent (the keys, the OP's client roster and TTLs, the presentation timeout, the PDP, the mongo URI, the presets, the nym-auth circuits, the registry mirrors, the WRPRC);
