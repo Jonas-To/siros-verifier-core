@@ -338,6 +338,11 @@ fn wallet_respond_inner(
     assert_eq!(header.typ.as_deref(), Some("oauth-authz-req+jwt"));
     let chain = sdjwt::x5c_chain(&header)?;
     let leaf_key = sdjwt::jwk_from_cert_der(&chain[0])?;
+    // CS-02 wallets require a numeric `iat` in the protected header.
+    assert!(
+        header.extra.get("iat").is_some_and(Value::is_i64),
+        "request object protected header must carry a numeric iat"
+    );
     let payload: Value =
         serde_json::from_slice(&jws::compact::verify_with_jwk(&leaf_key, jar)?).expect("jar json");
     assert_eq!(

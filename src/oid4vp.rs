@@ -537,6 +537,11 @@ fn create_request_with_response_mode(
     let mut header = JoseHeader::new(alg);
     header.typ = Some("oauth-authz-req+jwt".into());
     header.x5c = Some(chain_der.iter().map(|d| B64.encode(d)).collect());
+    // WE BUILD CS-02 wallets (the ITB+ headless wallet in strict mode) reject
+    // a request object without a numeric `iat` in the *protected header*
+    // ("invalid_jar_protected_iat"), not only in the claims. Same value as
+    // the payload's `iat`.
+    header.extra.insert("iat".into(), json!(now));
     let opts = SignOptions::new().with_key_reference_headers(true);
     let jar = sign_with_options(
         signer,
