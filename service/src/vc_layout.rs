@@ -1154,14 +1154,14 @@ fn emit_backend(
         .unwrap_or_else(|| "/family_name".to_string());
     bconfig.insert(
         "subject_pointer".into(),
-        toml::Value::String(subject_pointer),
+        toml::Value::String(subject_pointer.clone()),
     );
     if context.options.subject_pointer.is_none() {
         report.note("backend.config.subject_pointer defaults to /family_name — pass --subject-pointer to map the deployment's subject claim");
     }
     bconfig.insert(
         "dcql".into(),
-        toml::Value::Table(emit_fallback_dcql(cfg, report)),
+        toml::Value::Table(emit_fallback_dcql(cfg, report, &subject_pointer)),
     );
     bconfig.insert(
         "attribute_map".into(),
@@ -1182,9 +1182,18 @@ fn emit_backend(
 /// The fallback DCQL: one entry per supported credential whose format
 /// this service speaks. Claims stay deliberately empty (the
 /// mandatory-only request); the presets carry the real queries.
-fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report) -> toml::Table {
+fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report, subject_pointer: &str) -> toml::Table {
     let metadata = &cfg.common.credential_metadata;
     let mut credentials: Vec<toml::Value> = Vec::new();
+    let mut subject_claim: Option<String> = None;
+    // The identifier's claim path, as a DCQL claims entry.
+    let segments: Vec<toml::Value> = subject_pointer
+        .trim_start_matches('/')
+        .split('/')
+        .map(|s| toml::Value::String(s.to_string()))
+        .collect();
+    let mut subject_claim_path = toml::Table::new();
+    subject_claim_path.insert("path".into(), toml::Value::Array(segments));
     for supported in cfg
         .verifier
         .inbound
@@ -1202,20 +1211,43 @@ fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report) -> toml::Table {
             ));
             continue;
         };
-        match credential_query(scope, meta) {
-            Some(query) => credentials.push(toml::Value::Table(query)),
-            None => report.warned.push((
-                format!("verifier.inbound.openid4vp.supported_credentials (scope {scope})"),
-                format!(
-                    "the {} format is not supported (ldp_vc or unknown) — dropped from the fallback DCQL",
-                    meta.format.as_deref().unwrap_or("unset")
-                ),
-            )),
+        let mut query = match credential_query(scope, meta) {
+            Some(query) => query,
+            None => {
+                report.warned.push((
+                    format!("verifier.inbound.openid4vp.supported_credentials (scope {scope})"),
+                    format!(
+                        "the {} format is not supported (ldp_vc or unknown) — dropped from the fallback DCQL",
+                        meta.format.as_deref().unwrap_or("unset")
+                    ),
+                ));
+                continue;
+            }
+        };
+        // The OP's OIDC logins ride this fallback — the FIRST supported
+        // credential's query must request the identifier the subject
+        // derives from, or a wallet omitting it passes verification and
+        // fails at the subject claim. Only the first query carries it.
+        if subject_claim.is_none() {
+            subject_claim = Some(scope.clone());
+            if let Some(claims) = query.get_mut("claims").and_then(|c| c.as_array_mut()) {
+                claims.push(toml::Value::Table(subject_claim_path.clone()));
+            } else {
+                query.insert(
+                    "claims".into(),
+                    toml::Value::Array(vec![toml::Value::Table(subject_claim_path.clone())]),
+                );
+            }
         }
+        credentials.push(toml::Value::Table(query));
     }
     let mut dcql = toml::Table::new();
     dcql.insert("credentials".into(), toml::Value::Array(credentials));
-    report.note("backend.config.dcql claims are deliberately empty — the fallback requests only the mandatory claims; the presets carry the credential-specific queries");
+    if subject_claim.is_some() {
+        report.mapped(
+            "--subject-pointer -> backend.config.dcql[0].claims — the fallback requests the subject identifier",
+        );
+    }
     dcql
 }
 

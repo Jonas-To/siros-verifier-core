@@ -444,3 +444,46 @@ async fn the_translated_layout_boots_the_service_healthy() {
     let _ = child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_fallback_dcql_requests_the_subject_identifier() {
+    // The OP's OIDC logins ride the fallback — its FIRST query must
+    // request the identifier the subject derives from, or a wallet
+    // omitting it passes verification and fails at the subject claim.
+    let translation = translate_gdc();
+    let doc: toml::Table =
+        toml::from_str(&translation.toml).expect("the emitted proxy.toml parses as TOML");
+    let backend = doc.get("backend").and_then(|v| v.as_array()).unwrap()[0]
+        .as_table()
+        .unwrap();
+    let bconfig = backend.get("config").and_then(|v| v.as_table()).unwrap();
+    let credentials = bconfig
+        .get("dcql")
+        .and_then(|v| v.as_table())
+        .unwrap()
+        .get("credentials")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let first = credentials[0].as_table().unwrap();
+    let claims = first
+        .get("claims")
+        .and_then(|v| v.as_array())
+        .expect("the first fallback query carries claims");
+    let paths: Vec<String> = claims
+        .iter()
+        .filter_map(|c| {
+            let segments: Vec<String> = c
+                .as_table()?
+                .get("path")?
+                .as_array()?
+                .iter()
+                .map(|p| p.as_str().unwrap().to_string())
+                .collect();
+            Some(segments.join("."))
+        })
+        .collect();
+    assert!(
+        paths.contains(&"personal_administrative_number".to_string()),
+        "the fallback requests the configured identifier claim (paths: {paths:?})"
+    );
+}
