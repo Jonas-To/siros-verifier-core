@@ -128,15 +128,16 @@ impl SecretProvider for PlatformSecretProvider {
 /// core's [`siros_verifier_core::config::ClientRegistrationProvider`]):
 /// the `[[frontend.config.clients]]` block plus a secret provider.
 ///
-/// Each entry may carry its credential as an inline `client_secret`, as a
-/// `client_secret_env` reference, or not at all (a `none`/
-/// `private_key_jwt` client). The `_env` reference is resolved through
-/// the secret provider at boot and stripped from the entry before it
-/// reaches the consumer's parser — the downstream client model never
-/// learns about `_env` fields. Both an inline secret and an `_env`
-/// reference on one entry is refused, as is a duplicate `client_id`
-/// across the roster (the consumer's store keys by id and would silently
-/// keep only the last).
+/// Each entry may carry its id and its credential as inline values, as
+/// `client_id_env`/`client_secret_env` references (the #935 model: both
+/// halves of the pair from one mechanism), or the credential may be
+/// absent altogether (a `none`/`private_key_jwt` client). Each `_env`
+/// reference is resolved through the secret provider at boot and
+/// stripped from the entry before it reaches the consumer's parser —
+/// the downstream client model never learns about `_env` fields. An
+/// inline value AND an `_env` reference for the same member is refused,
+/// as is a duplicate `client_id` across the roster (the consumer's
+/// store keys by id and would silently keep only the last).
 #[derive(Clone)]
 pub struct ConfigClientRegistration {
     entries: Vec<Value>,
@@ -166,30 +167,42 @@ impl ConfigClientRegistration {
                 )))
             }
         };
-        let inline = object.get("client_secret").cloned();
-        let env = object.get("client_secret_env").cloned();
-        if inline.is_some() && env.is_some() {
-            return Err(CoreError::Policy(format!(
-                "client {id}: both client_secret and client_secret_env are set — two sources for one value"
-            )));
-        }
         let mut object = object;
-        if let Some(env) = env {
-            let name = env.as_str().ok_or_else(|| {
-                CoreError::Policy(format!("client {id}: client_secret_env is not a string"))
-            })?;
-            let secret = self
-                .secrets
-                .resolve(&SecretSource::Env(name.to_string()))
-                .map_err(|e| CoreError::Policy(format!("client {id}: {e}")))?;
-            if secret.is_empty() {
-                return Err(CoreError::Policy(format!(
-                    "client {id}: client_secret_env {name} is set to the empty string"
-                )));
+        // The #935 model: BOTH halves of the credential pair may name
+        // their env var — one mechanism manages the whole pair. Each
+        // `_env` reference resolves through the secret provider and is
+        // stripped before the entry reaches the consumer's parser.
+        for (member, reference) in [
+            ("client_id", "client_id_env"),
+            ("client_secret", "client_secret_env"),
+        ] {
+            let inline = object.get(member).cloned();
+            let env = object.get(reference).cloned();
+            match (inline, env) {
+                (Some(_), Some(_)) => {
+                    return Err(CoreError::Policy(format!(
+                        "client {id}: both {member} and {reference} are set — two sources for one value"
+                    )))
+                }
+                (None, Some(env)) => {
+                    let name = env.as_str().ok_or_else(|| {
+                        CoreError::Policy(format!("client {id}: {reference} is not a string"))
+                    })?;
+                    let value = self
+                        .secrets
+                        .resolve(&SecretSource::Env(name.to_string()))
+                        .map_err(|e| CoreError::Policy(format!("client {id}: {e}")))?;
+                    if value.is_empty() {
+                        return Err(CoreError::Policy(format!(
+                            "client {id}: {reference} {name} is set to the empty string"
+                        )));
+                    }
+                    object.insert(member.into(), Value::String(value));
+                }
+                _ => {}
             }
-            object.insert("client_secret".into(), Value::String(secret));
+            object.remove(reference);
         }
-        object.remove("client_secret_env");
         Ok(Value::Object(object))
     }
 

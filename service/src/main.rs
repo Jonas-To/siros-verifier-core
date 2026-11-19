@@ -54,10 +54,11 @@ async fn main() -> std::io::Result<()> {
                 .iter()
                 .position(|a| a == "--emit-toml")
                 .and_then(|emit| args.get(emit + 1).cloned());
+            let allow_insecure_pdp = args.iter().any(|a| a == "--allow-insecure-pdp");
             // The adapter's startup-only reads, kept off the async runtime's
             // worker threads like every other boot-time file access.
             let translated = actix_web::rt::task::spawn_blocking(move || {
-                vc_layout_boot(&source, emit_out.as_deref())
+                vc_layout_boot(&source, emit_out.as_deref(), allow_insecure_pdp)
             })
             .await
             .unwrap_or_else(|e| {
@@ -69,7 +70,17 @@ async fn main() -> std::io::Result<()> {
                 std::process::exit(1);
             });
             match translated {
-                Some((path, dir)) => (path, Some(dir)),
+                Some((path, dir, bind_hint)) => {
+                    // The vc layout's api_server.addr is the bind the
+                    // deployment's ingress expects; an explicit
+                    // TUNNELBANA_BIND wins.
+                    if let Some(bind) = bind_hint {
+                        if std::env::var_os("TUNNELBANA_BIND").is_none() {
+                            std::env::set_var("TUNNELBANA_BIND", bind);
+                        }
+                    }
+                    (path, Some(dir))
+                }
                 None => std::process::exit(0),
             }
         } else {
@@ -648,15 +659,23 @@ async fn build_openid4vp_backend(
 
 /// The vc-layout boot path: read the vc-stack layout, translate, and
 /// either emit-and-exit (returning None — the process should stop) or
-/// hand the boot the translated config's path plus the temp directory
-/// holding it. Runs on the blocking pool: startup-only file access.
+/// hand the boot the translated config's path, the temp directory
+/// holding it, and the bind the layout's api_server asked for. Runs on
+/// the blocking pool: startup-only file access.
+#[allow(clippy::type_complexity)]
 fn vc_layout_boot(
     source: &str,
     emit_out: Option<&str>,
-) -> anyhow::Result<Option<(String, std::path::PathBuf)>> {
+    allow_insecure_pdp: bool,
+) -> anyhow::Result<Option<(String, std::path::PathBuf, Option<String>)>> {
     let yaml = std::fs::read_to_string(source)
         .with_context(|| format!("reading the vc layout {source}"))?;
-    let translation = siros_verifier_service::vc_layout::translate(&yaml)
+    let source_dir = std::path::Path::new(source)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let options = siros_verifier_service::vc_layout::TranslateOptions { allow_insecure_pdp };
+    let translation = siros_verifier_service::vc_layout::translate(&yaml, &source_dir, &options)
         .with_context(|| format!("translating the vc layout {source}"))?;
     eprintln!(
         "vc layout {source} translated ({} mapped, {} known-unsupported, {} notes):",
@@ -665,18 +684,54 @@ fn vc_layout_boot(
         translation.report.notes.len()
     );
     eprintln!("{}", translation.report);
+    // The emitted config can carry credentials (the mongo URI embeds
+    // them) — owner-only modes on both the inspection output and the
+    // boot's temp copy.
     if let Some(out) = emit_out {
         let out = if out.is_empty() { "proxy.toml" } else { out };
         std::fs::write(out, &translation.toml)
             .with_context(|| format!("writing the translated config {out}"))?;
+        restrict_file_permissions(out)?;
         eprintln!("the translated proxy.toml is at {out}");
         return Ok(None);
     }
     let dir = std::env::temp_dir().join(format!("siros-verifier-vc-layout-{}", std::process::id()));
     std::fs::create_dir_all(&dir).with_context(|| "creating the translation directory")?;
+    restrict_dir_permissions(&dir)?;
     let path = dir.join("proxy.toml");
     std::fs::write(&path, &translation.toml).with_context(|| "writing the translated config")?;
-    Ok(Some((path.to_string_lossy().into_owned(), dir)))
+    restrict_file_permissions(&path.to_string_lossy())?;
+    Ok(Some((
+        path.to_string_lossy().into_owned(),
+        dir,
+        translation.bind_hint,
+    )))
+}
+
+/// Owner-only mode on a written file (the translated config may carry
+/// credentials).
+#[cfg(unix)]
+fn restrict_file_permissions(path: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {path} to owner-only"))
+}
+
+#[cfg(unix)]
+fn restrict_dir_permissions(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restricting {} to owner-only", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_file_permissions(_path: &str) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_permissions(_path: &std::path::Path) -> anyhow::Result<()> {
+    Ok(())
 }
 
 /// The config file's directory: the base sibling paths (and relative
