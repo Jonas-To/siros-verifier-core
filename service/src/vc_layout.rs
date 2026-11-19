@@ -614,11 +614,29 @@ pub fn translate(source: &str) -> Result<Translation> {
 
 fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
     let mut root = toml::Table::new();
+    root.insert(
+        "base_url".into(),
+        toml::Value::String(emit_identity(cfg, report)),
+    );
+    emit_cookies(cfg, &mut root, report);
+    emit_logging(cfg, &mut root);
+    let mut frontends: Vec<toml::Value> = Vec::new();
+    frontends.push(toml::Value::Table(emit_ui_frontend(cfg, report)));
+    if let Some(oidc) = emit_oidc_frontend(cfg, report) {
+        frontends.push(toml::Value::Table(oidc));
+    }
+    root.insert("frontend".into(), toml::Value::Array(frontends));
+    let backends = vec![toml::Value::Table(emit_backend(cfg, report)?)];
+    root.insert("backend".into(), toml::Value::Array(backends));
+    let doc = toml::Value::Table(root);
+    toml::to_string_pretty(&doc).map_err(|e| anyhow!("emitting the proxy.toml: {e}"))
+}
 
-    // The base identity. The vc-stack's OP issuer is the verifier's own
-    // root; tunnelbana serves the OP under its frontend module path —
-    // the issuer URL MOVES, and the RPs' discovery URL follows. The
-    // report says so.
+/// The deployment's public identity. The vc-stack's OP issuer is the
+/// verifier's own root; tunnelbana serves the OP under its frontend
+/// module path — the issuer URL MOVES, and the RPs' discovery URL
+/// follows. The report says so.
+fn emit_identity(cfg: &VcConfig, report: &mut Report) -> String {
     let base_url = cfg.verifier.public_url.trim_end_matches('/').to_string();
     if let Some(oidc) = cfg.verifier.outbound.oidc_provider.as_ref() {
         if let Some(issuer) = oidc.issuer.as_deref() {
@@ -632,10 +650,13 @@ fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
     report.note(format!(
         "the OIDC OP moves from the verifier root to {base_url}/OIDC — the RPs' discovery and token URLs must follow (the emitted frontend advertises its own module base)"
     ));
-    root.insert("base_url".into(), toml::Value::String(base_url.clone()));
+    base_url
+}
 
-    // The state secret rides the deploy tooling's existing env var —
-    // the same channel the vc layout's own env-substitution used.
+/// The state secret and the cookie shape. The state secret rides the
+/// deploy tooling's existing env var — the same channel the vc layout's
+/// own env substitution used.
+fn emit_cookies(cfg: &VcConfig, root: &mut toml::Table, report: &mut Report) {
     root.insert(
         "state_encryption_key".into(),
         toml::Value::String("${SIROS_VERIFIER_STATE_KEY}".into()),
@@ -658,89 +679,100 @@ fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
         .and_then(|o| o.session_duration)
         .unwrap_or(900);
     root.insert("state_cookie_max_age".into(), toml::Value::Integer(session));
+}
 
+fn emit_logging(cfg: &VcConfig, root: &mut toml::Table) {
     let mut logging = toml::Table::new();
     logging.insert("level".into(), toml::Value::String("info".into()));
     logging.insert(
         "format".into(),
-        toml::Value::String(if cfg.common.production.unwrap_or(false) {
-            "json".into()
-        } else {
-            "pretty".into()
-        }),
+        toml::Value::String(
+            if cfg.common.production.unwrap_or(false) {
+                "json"
+            } else {
+                "pretty"
+            }
+            .into(),
+        ),
     );
     root.insert("logging".into(), toml::Value::Table(logging));
+}
 
-    // The UI frontend: the presets (the labels carry over), the DC-API
-    // invocation when the vc layout enables it, the registry mirrors.
-    let mut frontends: Vec<toml::Value> = Vec::new();
+/// The ui frontend: the presets (the labels carry over), the DC-API
+/// invocation when the vc layout enables it, the registry mirrors.
+fn emit_ui_frontend(cfg: &VcConfig, report: &mut Report) -> toml::Table {
     let mut ui = toml::Table::new();
     let mut ui_config = toml::Table::new();
     let dc_api = cfg.verifier.digital_credentials.enable.unwrap_or(false);
-    let invocations: Vec<toml::Value> = ["qr", "link"]
+    let invocations: Vec<toml::Value> = ["qr", "dc-api", "link"]
         .iter()
         .map(|s| toml::Value::String((*s).to_string()))
-        .chain(std::iter::once(toml::Value::String(
-            if dc_api { "dc-api" } else { "link" }.into(),
-        )))
         .collect();
-    let _ = invocations;
-    ui_config.insert(
-        "invocations".into(),
-        toml::Value::Array(
-            ["qr", "dc-api", "link"]
-                .iter()
-                .map(|s| toml::Value::String((*s).to_string()))
-                .collect(),
-        ),
-    );
+    if dc_api {
+        ui_config.insert("invocations".into(), toml::Value::Array(invocations));
+    }
     ui_config.insert(
         "schemes".into(),
         toml::Value::Array(vec![toml::Value::String("openid4vp".into())]),
     );
-    if let Some(registry) = cfg.common.credential_registry.as_ref() {
-        if let Some(mirror) = registry
-            .registries
-            .first()
-            .and_then(|r| r.mirrors.first())
-            .and_then(|m| m.base_url.clone())
-        {
-            ui_config.insert("registry_url".into(), toml::Value::String(mirror.clone()));
-            let host = mirror
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .split('/')
-                .next()
-                .unwrap_or_default()
-                .to_string();
-            ui_config.insert(
-                "registry_allowed_hosts".into(),
-                toml::Value::Array(vec![toml::Value::String(host)]),
-            );
-            let refresh = registry
-                .refresh_interval
-                .as_deref()
-                .and_then(parse_duration_secs)
-                .unwrap_or(3600);
-            ui_config.insert(
-                "registry_cache_seconds".into(),
-                toml::Value::Integer(refresh),
-            );
-        }
+    emit_registry(cfg, &mut ui_config);
+    ui_config.insert(
+        "presets".into(),
+        toml::Value::Array(emit_presets(cfg, report)),
+    );
+    ui.insert("type".into(), toml::Value::String("ui".into()));
+    ui.insert("name".into(), toml::Value::String("ui".into()));
+    ui.insert("config".into(), toml::Value::Table(ui_config));
+    ui
+}
+
+/// The registry mirrors: the first mirror's base_url becomes the ui
+/// frontend's registry source, its host the allowlist entry.
+fn emit_registry(cfg: &VcConfig, ui_config: &mut toml::Table) {
+    if let Some(mirror) = cfg
+        .common
+        .credential_registry
+        .as_ref()
+        .and_then(|r| r.registries.first())
+        .and_then(|r| r.mirrors.first())
+        .and_then(|m| m.base_url.clone())
+    {
+        ui_config.insert("registry_url".into(), toml::Value::String(mirror.clone()));
+        let host = mirror
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        ui_config.insert(
+            "registry_allowed_hosts".into(),
+            toml::Value::Array(vec![toml::Value::String(host)]),
+        );
+        let refresh = cfg
+            .common
+            .credential_registry
+            .as_ref()
+            .and_then(|r| r.refresh_interval.as_deref())
+            .and_then(parse_duration_secs)
+            .unwrap_or(3600);
+        ui_config.insert(
+            "registry_cache_seconds".into(),
+            toml::Value::Integer(refresh),
+        );
     }
-    // The presets: label (the vc map key), category rides the label
-    // prefix, credentials become DCQL.
+}
+
+/// The presets: label (the vc map key), the credentials become DCQL. A
+/// preset whose every credential uses an unsupported format is dropped
+/// with the warning naming it.
+fn emit_presets(cfg: &VcConfig, report: &mut Report) -> Vec<toml::Value> {
     let mut presets: Vec<toml::Value> = Vec::new();
     for (label, preset) in &cfg.verifier.presets {
-        let mut entry = toml::Table::new();
-        entry.insert("id".into(), toml::Value::String(slug(label)));
-        entry.insert("label".into(), toml::Value::String(label.clone()));
         let mut credentials: Vec<toml::Value> = Vec::new();
-        let mut skipped: Vec<String> = Vec::new();
         for (scope, credential) in &preset.credentials {
-            match credential_dcql(scope, credential, cfg) {
-                Some(query) => credentials.push(toml::Value::Table(query)),
-                None => skipped.push(scope.clone()),
+            if let Some(query) = credential_dcql(scope, credential, cfg) {
+                credentials.push(toml::Value::Table(query));
             }
         }
         if credentials.is_empty() {
@@ -750,135 +782,130 @@ fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
             ));
             continue;
         }
-        entry.insert(
-            "dcql".into(),
-            toml::Value::Table({
-                let mut t = toml::Table::new();
-                t.insert("credentials".into(), toml::Value::Array(credentials));
-                t
-            }),
-        );
+        let mut entry = toml::Table::new();
+        entry.insert("id".into(), toml::Value::String(slug(label)));
+        entry.insert("label".into(), toml::Value::String(label.clone()));
+        let mut dcql = toml::Table::new();
+        dcql.insert("credentials".into(), toml::Value::Array(credentials));
+        entry.insert("dcql".into(), toml::Value::Table(dcql));
         presets.push(toml::Value::Table(entry));
     }
-    ui_config.insert("presets".into(), toml::Value::Array(presets));
-    ui.insert("type".into(), toml::Value::String("ui".into()));
-    ui.insert("name".into(), toml::Value::String("ui".into()));
-    ui.insert("config".into(), toml::Value::Table(ui_config));
-    frontends.push(toml::Value::Table(ui));
+    presets
+}
 
-    // The OIDC frontend: the vc layout's OP (the RP-facing surface) and
-    // its client roster.
-    if let Some(oidc) = cfg.verifier.outbound.oidc_provider.as_ref() {
-        let mut fe = toml::Table::new();
-        fe.insert("type".into(), toml::Value::String("oidc".into()));
-        fe.insert("name".into(), toml::Value::String("OIDC".into()));
-        let mut config = toml::Table::new();
-        if let Some(key_path) = cfg
-            .verifier
-            .key_config
-            .as_ref()
-            .and_then(|k| k.private_key_path.clone())
-        {
-            config.insert("signing_key_path".into(), toml::Value::String(key_path));
-            report
-                .mapped("verifier.key_config.private_key_path -> frontend.config.signing_key_path");
-        }
-        config.insert(
-            "signing_algorithm".into(),
-            toml::Value::String("ES256".into()),
-        );
-        config.insert(
-            "signing_key_id".into(),
-            toml::Value::String("vc-layout-op".into()),
-        );
-        for (member, seconds) in [
-            ("code_duration", "code_ttl"),
-            ("access_token_duration", "access_token_ttl"),
-            ("id_token_duration", "id_token_ttl"),
-            ("refresh_token_duration", "refresh_token_ttl"),
-        ] {
-            if let Some(v) = member_value(oidc, member) {
-                config.insert(seconds.into(), v);
-            }
-        }
-        if let Some(subject_type) = oidc.subject_type.as_deref() {
-            if subject_type == "pairwise" {
-                report.warned.push((
-                    "verifier.outbound.oidc_provider.subject_type".into(),
-                    "pairwise subjects — this service's OP mints public subjects; the vc salt does not carry over".into(),
-                ));
-            }
-        }
-        // The client roster: the vc clients map becomes the tunnelbana
-        // roster. `type: public` is a PKCE-only client (auth method
-        // "none"); a confidential vc client maps to client_secret_basic.
-        let mut clients: Vec<toml::Value> = Vec::new();
-        for (id, client) in cfg
-            .verifier
-            .inbound
-            .openid4vp
-            .as_ref()
-            .map(|o| o.clients.iter())
-            .into_iter()
-            .flatten()
-        {
-            let mut entry = toml::Table::new();
-            if let Some(env) = client.client_id_env.as_deref() {
-                entry.insert("client_id_env".into(), toml::Value::String(env.into()));
-                report.mapped(format!(
-                    "verifier.inbound.openid4vp.clients.{id}.client_id_env"
-                ));
-            } else {
-                entry.insert("client_id".into(), toml::Value::String(id.clone()));
-            }
-            let uris: Vec<String> = client
-                .redirect_uri
-                .iter()
-                .cloned()
-                .chain(client.redirect_uris.iter().flatten().cloned())
-                .collect();
-            entry.insert(
-                "redirect_uris".into(),
-                toml::Value::Array(
-                    uris.iter()
-                        .map(|u| toml::Value::String(u.clone()))
-                        .collect(),
-                ),
-            );
-            let public = client
-                .r#type
-                .as_deref()
-                .map(|t| t == "public")
-                .unwrap_or(true);
-            entry.insert(
-                "token_endpoint_auth_method".into(),
-                toml::Value::String(if public {
-                    "none".into()
-                } else {
-                    "client_secret_basic".into()
-                }),
-            );
-            if let Some(secret) = client.client_secret.as_deref() {
-                entry.insert("client_secret".into(), toml::Value::String(secret.into()));
-            }
-            if let Some(env) = client.client_secret_env.as_deref() {
-                entry.insert("client_secret_env".into(), toml::Value::String(env.into()));
-                report.mapped(format!(
-                    "verifier.inbound.openid4vp.clients.{id}.client_secret_env"
-                ));
-            }
-            clients.push(toml::Value::Table(entry));
-        }
-        if !clients.is_empty() {
-            config.insert("clients".into(), toml::Value::Array(clients));
-        }
-        fe.insert("config".into(), toml::Value::Table(config));
-        frontends.push(toml::Value::Table(fe));
+/// The OP frontend: the vc layout's oidc_provider and its client roster.
+/// `type: public` is the vc name for a PKCE-only client (auth method
+/// "none"); a confidential client maps to client_secret_basic.
+fn emit_oidc_frontend(cfg: &VcConfig, report: &mut Report) -> Option<toml::Table> {
+    let oidc = cfg.verifier.outbound.oidc_provider.as_ref()?;
+    let mut fe = toml::Table::new();
+    fe.insert("type".into(), toml::Value::String("oidc".into()));
+    fe.insert("name".into(), toml::Value::String("OIDC".into()));
+    let mut config = toml::Table::new();
+    if let Some(key_path) = cfg
+        .verifier
+        .key_config
+        .as_ref()
+        .and_then(|k| k.private_key_path.clone())
+    {
+        config.insert("signing_key_path".into(), toml::Value::String(key_path));
+        report.mapped("verifier.key_config.private_key_path -> frontend.config.signing_key_path");
     }
-    root.insert("frontend".into(), toml::Value::Array(frontends));
+    config.insert(
+        "signing_algorithm".into(),
+        toml::Value::String("ES256".into()),
+    );
+    config.insert(
+        "signing_key_id".into(),
+        toml::Value::String("vc-layout-op".into()),
+    );
+    for (member, ttl) in [
+        ("code_duration", "code_ttl"),
+        ("access_token_duration", "access_token_ttl"),
+        ("id_token_duration", "id_token_ttl"),
+        ("refresh_token_duration", "refresh_token_ttl"),
+    ] {
+        if let Some(v) = member_value(oidc, member) {
+            config.insert(ttl.into(), v);
+        }
+    }
+    if oidc.subject_type.as_deref() == Some("pairwise") {
+        report.warned.push((
+            "verifier.outbound.oidc_provider.subject_type".into(),
+            "pairwise subjects — this service's OP mints public subjects; the vc salt does not carry over".into(),
+        ));
+    }
+    let clients = emit_clients(cfg, report);
+    if !clients.is_empty() {
+        config.insert("clients".into(), toml::Value::Array(clients));
+    }
+    fe.insert("config".into(), toml::Value::Table(config));
+    Some(fe)
+}
 
-    // The openid4vp backend.
-    let mut backends: Vec<toml::Value> = Vec::new();
+/// The client roster: the vc clients map (keyed by client id) becomes
+/// the tunnelbana roster; the #935 `_env` fields pass through to this
+/// service's own env resolution.
+fn emit_clients(cfg: &VcConfig, report: &mut Report) -> Vec<toml::Value> {
+    let mut clients: Vec<toml::Value> = Vec::new();
+    let openid4vp = match cfg.verifier.inbound.openid4vp.as_ref() {
+        Some(o) => o,
+        None => return clients,
+    };
+    for (id, client) in &openid4vp.clients {
+        let mut entry = toml::Table::new();
+        if let Some(env) = client.client_id_env.as_deref() {
+            entry.insert("client_id_env".into(), toml::Value::String(env.into()));
+            report.mapped(format!(
+                "verifier.inbound.openid4vp.clients.{id}.client_id_env"
+            ));
+        } else {
+            entry.insert("client_id".into(), toml::Value::String(id.clone()));
+        }
+        let uris: Vec<String> = client
+            .redirect_uri
+            .iter()
+            .cloned()
+            .chain(client.redirect_uris.iter().flatten().cloned())
+            .collect();
+        entry.insert(
+            "redirect_uris".into(),
+            toml::Value::Array(
+                uris.iter()
+                    .map(|u| toml::Value::String(u.clone()))
+                    .collect(),
+            ),
+        );
+        let public = client
+            .r#type
+            .as_deref()
+            .map(|t| t == "public")
+            .unwrap_or(true);
+        entry.insert(
+            "token_endpoint_auth_method".into(),
+            toml::Value::String(if public {
+                "none".into()
+            } else {
+                "client_secret_basic".into()
+            }),
+        );
+        if let Some(secret) = client.client_secret.as_deref() {
+            entry.insert("client_secret".into(), toml::Value::String(secret.into()));
+        }
+        if let Some(env) = client.client_secret_env.as_deref() {
+            entry.insert("client_secret_env".into(), toml::Value::String(env.into()));
+            report.mapped(format!(
+                "verifier.inbound.openid4vp.clients.{id}.client_secret_env"
+            ));
+        }
+        clients.push(toml::Value::Table(entry));
+    }
+    clients
+}
+
+/// The openid4vp backend's config: the keys, the PDP, the WRPRC, the
+/// receipt conventions, the fallback DCQL, the storage, the zkp block.
+fn emit_backend(cfg: &VcConfig, report: &mut Report) -> Result<toml::Table> {
     let mut backend = toml::Table::new();
     backend.insert("type".into(), toml::Value::String("openid4vp".into()));
     backend.insert("name".into(), toml::Value::String("vp".into()));
@@ -940,10 +967,30 @@ fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
         toml::Value::String("/family_name".into()),
     );
     report.note("backend.config.subject_pointer = \"/family_name\" — the vc layout has no subject member; adjust to the deployment's subject claim");
+    bconfig.insert(
+        "dcql".into(),
+        toml::Value::Table(emit_fallback_dcql(cfg, report)),
+    );
+    bconfig.insert(
+        "attribute_map".into(),
+        toml::Value::Table(toml::Table::new()),
+    );
+    report.note("backend.config.attribute_map is empty — the UI's attribute naming (the result page's labels) is operator-added");
+    emit_storage(cfg, &mut bconfig, report);
+    if cfg.verifier.nym_auth.enable.unwrap_or(false) {
+        bconfig.insert("zkp".into(), zkp_table(cfg, report)?);
+        report.mapped("verifier.nym_auth -> backend.config.zkp");
+    } else {
+        report.note("verifier.nym_auth.enable is off — no zkp block");
+    }
+    backend.insert("config".into(), toml::Value::Table(bconfig));
+    Ok(backend)
+}
 
-    // The DCQL fallback: one entry per supported credential whose format
-    // this service speaks. Claims stay deliberately empty (the
-    // mandatory-only request); the presets carry the real queries.
+/// The fallback DCQL: one entry per supported credential whose format
+/// this service speaks. Claims stay deliberately empty (the
+/// mandatory-only request); the presets carry the real queries.
+fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report) -> toml::Table {
     let metadata = &cfg.common.credential_metadata;
     let mut credentials: Vec<toml::Value> = Vec::new();
     for supported in cfg
@@ -967,35 +1014,28 @@ fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
             Some(query) => credentials.push(toml::Value::Table(query)),
             None => report.warned.push((
                 format!("verifier.inbound.openid4vp.supported_credentials (scope {scope})"),
-                format!("the {} format is not supported (ldp_vc or unknown) — dropped from the fallback DCQL", meta.format.as_deref().unwrap_or("unset")),
+                format!(
+                    "the {} format is not supported (ldp_vc or unknown) — dropped from the fallback DCQL",
+                    meta.format.as_deref().unwrap_or("unset")
+                ),
             )),
         }
     }
     let mut dcql = toml::Table::new();
     dcql.insert("credentials".into(), toml::Value::Array(credentials));
-    bconfig.insert("dcql".into(), toml::Value::Table(dcql));
     report.note("backend.config.dcql claims are deliberately empty — the fallback requests only the mandatory claims; the presets carry the credential-specific queries");
-    bconfig.insert(
-        "attribute_map".into(),
-        toml::Value::Table(toml::Table::new()),
-    );
-    report.note("backend.config.attribute_map is empty — the UI's attribute naming (the result page's labels) is operator-added");
+    dcql
+}
 
-    // The storage: the vc mongo URI carries verbatim (its own
-    // credentials ride inside it, or the vc layout's env substitution).
+/// The storage: the vc mongo URI carries verbatim (its own credentials
+/// ride inside it, or the vc layout's env substitution). Absent mongo —
+/// the single-process memory store.
+fn emit_storage(cfg: &VcConfig, bconfig: &mut toml::Table, report: &mut Report) {
     let mut storage = toml::Table::new();
     if let Some(mongo) = cfg.common.mongo.as_ref().and_then(|m| m.uri.clone()) {
         storage.insert("backend".into(), toml::Value::String("mongodb".into()));
         storage.insert("uri".into(), toml::Value::String(mongo));
         report.mapped("common.mongo.uri -> backend.config.storage.uri");
-    } else {
-        storage.insert("backend".into(), toml::Value::String("memory".into()));
-        report.warned.push((
-            "common.mongo".into(),
-            "absent — the translated deployment runs single-process memory storage".into(),
-        ));
-    }
-    if storage.get("backend").and_then(|v| v.as_str()) == Some("mongodb") {
         storage.insert(
             "database".into(),
             toml::Value::String("siros_verifier".into()),
@@ -1005,24 +1045,14 @@ fn emit(cfg: &VcConfig, report: &mut Report) -> Result<String> {
             toml::Value::String("presentation_flows".into()),
         );
         report.note("backend.config.storage database/collection follow this service's convention (the vc layout names no flow store)");
+    } else {
+        storage.insert("backend".into(), toml::Value::String("memory".into()));
+        report.warned.push((
+            "common.mongo".into(),
+            "absent — the translated deployment runs single-process memory storage".into(),
+        ));
     }
     bconfig.insert("storage".into(), toml::Value::Table(storage));
-
-    // The zkp block: the vc nym_auth circuits map one-to-one.
-    if cfg.verifier.nym_auth.enable.unwrap_or(false) {
-        let zkp = zkp_table(cfg, report)?;
-        bconfig.insert("zkp".into(), zkp);
-        report.mapped("verifier.nym_auth -> backend.config.zkp");
-    } else {
-        report.note("verifier.nym_auth.enable is off — no zkp block");
-    }
-
-    backend.insert("config".into(), toml::Value::Table(bconfig));
-    backends.push(toml::Value::Table(backend));
-    root.insert("backend".into(), toml::Value::Array(backends));
-
-    let doc = toml::Value::Table(root);
-    toml::to_string_pretty(&doc).map_err(|e| anyhow!("emitting the proxy.toml: {e}"))
 }
 
 /// One credential query from a `credential_metadata` entry: the
@@ -1155,90 +1185,31 @@ fn credential_dcql(
 /// query comes from the first zkp preset (the deployment's own
 /// vehicle), the system/proof values from the allowlist's system_ids.
 fn zkp_table(cfg: &VcConfig, _report: &mut Report) -> Result<toml::Value> {
-    let mut zkp = toml::Table::new();
     let allow = &cfg.verifier.nym_auth.circuits.allow;
     if allow.is_empty() {
         return Err(anyhow!(
             "verifier.nym_auth.enable is on but circuits.allow is empty — the zkp backend refuses to start without a circuit"
         ));
     }
-    // The query: the first preset whose credential uses a zk format.
-    let mut query: Option<toml::Table> = None;
-    for preset in cfg.verifier.presets.values() {
-        for (scope, credential) in &preset.credentials {
-            if let Some(q) = credential_dcql(scope, credential, cfg) {
-                if q.get("format").and_then(|f| f.as_str()) == Some("zkp_req") {
-                    query = Some(q);
-                    break;
-                }
-            }
-        }
-        if query.is_some() {
-            break;
-        }
-    }
-    let Some(query) = query else {
-        return Err(anyhow!(
+    let query = zkp_query_from_presets(cfg).ok_or_else(|| {
+        anyhow!(
             "verifier.nym_auth.enable is on but no preset carries a circuit_zk/zkp_req query — the zkp backend needs its fallback query"
-        ));
-    };
-    zkp.insert("query".into(), toml::Value::Table(query));
-    let system_values: Vec<toml::Value> = allow
-        .iter()
-        .filter_map(|e| e.get("system_id").and_then(|v| v.as_str()))
-        .map(|s| toml::Value::String(s.to_string()))
-        .collect();
-    zkp.insert(
-        "system_id_values".into(),
-        toml::Value::Array(system_values.clone()),
-    );
-    let proof_values: Vec<toml::Value> = allow
-        .iter()
-        .filter_map(|e| e.get("system_id").and_then(|v| v.as_str()))
-        .map(|s| {
-            toml::Value::String(if s.contains("vega") {
-                "vega-v1".to_string()
-            } else {
-                "longfellow-libzk-v1".to_string()
-            })
-        })
-        .collect();
-    zkp.insert(
-        "proof_system_values".into(),
-        toml::Value::Array(proof_values),
-    );
+        )
+    })?;
+    let mut zkp = toml::Table::new();
+    zkp.insert("query".into(), toml::Value::Table(query.clone()));
+    zkp.insert("system_id_values".into(), system_id_values(allow));
+    zkp.insert("proof_system_values".into(), proof_system_values(allow));
     zkp.insert("role".into(), toml::Value::String("mdoc-issuer".into()));
     if let Some(verifier_id) = cfg.verifier.nym_auth.verifier_id.clone() {
         zkp.insert("verifier_id".into(), toml::Value::String(verifier_id));
     }
-    let mut subject_handle: Option<String> = None;
-    if let Some(q) = zkp.get("query").and_then(|q| q.as_table().cloned()) {
-        if let Some(reqs) = q.get("_req").and_then(|r| r.as_array()) {
-            if let Some(first) = reqs.first().and_then(|r| r.as_table()) {
-                if let Some(ret) = first.get("return").and_then(|v| v.as_str()) {
-                    subject_handle = Some(ret.to_string());
-                }
-            }
-        }
-    }
-    if let Some(handle) = subject_handle {
-        zkp.insert("subject_handle".into(), toml::Value::String(handle));
+    if let Some(handle) = query_return(&query, "pseudonym") {
+        zkp.insert("subject_handle".into(), toml::Value::String(handle.clone()));
     }
     let mut attribute_map = toml::Table::new();
-    if let Some(q) = zkp.get("query").and_then(|q| q.as_table()) {
-        if let Some(reqs) = q.get("_req").and_then(|r| r.as_array()) {
-            for req in reqs.iter().filter_map(|r| r.as_table()) {
-                if let (Some(fn_id), Some(ret)) = (
-                    req.get("fn_id").and_then(|v| v.as_str()),
-                    req.get("return").and_then(|v| v.as_str()),
-                ) {
-                    if fn_id == "pseudonym" {
-                        attribute_map
-                            .insert("pseudonym".into(), toml::Value::String(ret.to_string()));
-                    }
-                }
-            }
-        }
+    if let Some(handle) = query_return(&query, "pseudonym") {
+        attribute_map.insert("pseudonym".into(), toml::Value::String(handle));
     }
     zkp.insert("attribute_map".into(), toml::Value::Table(attribute_map));
     zkp.insert(
@@ -1270,6 +1241,66 @@ fn zkp_table(cfg: &VcConfig, _report: &mut Report) -> Result<toml::Value> {
     circuits.insert("allow".into(), toml::Value::Array(allow_entries));
     zkp.insert("circuits".into(), toml::Value::Table(circuits));
     Ok(toml::Value::Table(zkp))
+}
+
+/// The first preset whose credential uses a zk format — the zkp
+/// backend's fallback query (the deployment's own vehicle).
+fn zkp_query_from_presets(cfg: &VcConfig) -> Option<toml::Table> {
+    for preset in cfg.verifier.presets.values() {
+        for (scope, credential) in &preset.credentials {
+            if let Some(q) = credential_dcql(scope, credential, cfg) {
+                if q.get("format").and_then(|f| f.as_str()) == Some("zkp_req") {
+                    return Some(q);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The allowlist's system ids, in order.
+fn system_id_values(allow: &[BTreeMap<String, Json>]) -> toml::Value {
+    toml::Value::Array(
+        allow
+            .iter()
+            .filter_map(|e| e.get("system_id").and_then(|v| v.as_str()))
+            .map(|s| toml::Value::String(s.to_string()))
+            .collect(),
+    )
+}
+
+/// The proof-system name for each allowlist entry: the vc layout names
+/// the system id; the proof system follows it (vega's entries carry
+/// vega's prover name, everything else the longfellow one).
+fn proof_system_values(allow: &[BTreeMap<String, Json>]) -> toml::Value {
+    toml::Value::Array(
+        allow
+            .iter()
+            .filter_map(|e| e.get("system_id").and_then(|v| v.as_str()))
+            .map(|s| {
+                toml::Value::String(if s.contains("vega") {
+                    "vega-v1".to_string()
+                } else {
+                    "longfellow-libzk-v1".to_string()
+                })
+            })
+            .collect(),
+    )
+}
+
+/// A req function's return value, by its fn_id — the subject handle and
+/// the attribute map derive from the pseudonym function's return name.
+fn query_return(query: &toml::Table, fn_id: &str) -> Option<String> {
+    let reqs = query.get("_req")?.as_array()?;
+    for req in reqs.iter().filter_map(|r| r.as_table()) {
+        if req.get("fn_id").and_then(|v| v.as_str()) == Some(fn_id) {
+            return req
+                .get("return")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+        }
+    }
+    None
 }
 
 fn json_to_toml(value: &Json) -> Result<toml::Value> {

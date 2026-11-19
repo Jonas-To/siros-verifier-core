@@ -6,6 +6,10 @@
 
 use siros_verifier_service::vc_layout;
 
+/// The gdc deployment's rendered vc-verifier.yaml, with ONE redaction:
+/// the mongo URI's embedded password (a live credential has no business
+/// committed in this repository; the URI's shape is what the adapter
+/// reads).
 const GDC: &str = include_str!("../testdata/vc-layout/gdc.yaml");
 
 #[test]

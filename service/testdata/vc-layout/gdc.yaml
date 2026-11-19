@@ -72,7 +72,7 @@ common:
     cache_database_name: verifier_cache
     enable: true
   mongo:
-    uri: mongodb://root:1kQ89kNlX3N647x1sWVHFCfANtuX1FBt@sirosid-gdc-mongodb.internal:27017/?authSource=admin
+    uri: mongodb://root:REDACTED-FOR-THE-FIXTURE@sirosid-gdc-mongodb.internal:27017/?authSource=admin
   production: false
   tracing:
     addr: otlp-collector:4318

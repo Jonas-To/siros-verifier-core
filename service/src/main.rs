@@ -44,63 +44,42 @@ async fn main() -> std::io::Result<()> {
     // (and the report printed) without starting the service — the
     // operator-inspection mode; without it, the translated config boots
     // the service directly, from a temp file the same boot path reads.
-    let (config_path, _vc_temp) = if let Some(index) =
-        args.iter().position(|a| a == "--from-vc-layout")
-    {
-        let source = args
-            .get(index + 1)
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "/etc/vc/config.yaml".to_string());
-        let yaml = std::fs::read_to_string(&source).unwrap_or_else(|e| {
-            eprintln!("failed to read the vc layout {source}: {e}");
-            std::process::exit(1);
-        });
-        let translation = siros_verifier_service::vc_layout::translate(&yaml).unwrap_or_else(|e| {
-            eprintln!("failed to translate the vc layout {source}: {e:#}");
-            std::process::exit(1);
-        });
-        eprintln!(
-            "vc layout {source} translated ({} mapped, {} known-unsupported, {} notes):",
-            translation.report.mapped.len(),
-            translation.report.warned.len(),
-            translation.report.notes.len()
-        );
-        eprintln!("{}", translation.report);
-        if let Some(emit) = args.iter().position(|a| a == "--emit-toml") {
-            let out = args
-                .get(emit + 1)
+    let (config_path, _vc_temp) =
+        if let Some(index) = args.iter().position(|a| a == "--from-vc-layout") {
+            let source = args
+                .get(index + 1)
                 .cloned()
-                .unwrap_or_else(|| "proxy.toml".to_string());
-            std::fs::write(&out, &translation.toml).unwrap_or_else(|e| {
-                eprintln!("failed to write the translated config {out}: {e}");
+                .unwrap_or_else(|| "/etc/vc/config.yaml".to_string());
+            let emit_out = args
+                .iter()
+                .position(|a| a == "--emit-toml")
+                .and_then(|emit| args.get(emit + 1).cloned());
+            // The adapter's startup-only reads, kept off the async runtime's
+            // worker threads like every other boot-time file access.
+            let translated = actix_web::rt::task::spawn_blocking(move || {
+                vc_layout_boot(&source, emit_out.as_deref())
+            })
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("joining the vc-layout translation task: {e}");
+                std::process::exit(1);
+            })
+            .unwrap_or_else(|e: anyhow::Error| {
+                eprintln!("{e:#}");
                 std::process::exit(1);
             });
-            eprintln!("the translated proxy.toml is at {out}");
-            std::process::exit(0);
-        }
-        let dir =
-            std::env::temp_dir().join(format!("siros-verifier-vc-layout-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
-            eprintln!(
-                "failed to create the translation dir {}: {e}",
-                dir.display()
-            );
-            std::process::exit(1);
-        });
-        let path = dir.join("proxy.toml");
-        std::fs::write(&path, &translation.toml).unwrap_or_else(|e| {
-            eprintln!("failed to write the translated config: {e}");
-            std::process::exit(1);
-        });
-        (path.to_string_lossy().into_owned(), Some(dir))
-    } else {
-        (
-            args.first()
-                .cloned()
-                .unwrap_or_else(|| "/etc/siros-verifier/proxy.toml".to_string()),
-            None,
-        )
-    };
+            match translated {
+                Some((path, dir)) => (path, Some(dir)),
+                None => std::process::exit(0),
+            }
+        } else {
+            (
+                args.first()
+                    .cloned()
+                    .unwrap_or_else(|| "/etc/siros-verifier/proxy.toml".to_string()),
+                None,
+            )
+        };
     let cfg = ProxyConfig::load(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to load config {config_path}: {e}");
         std::process::exit(1);
@@ -665,6 +644,39 @@ async fn build_openid4vp_backend(
         .with_status_list_client(Arc::new(status_list_client));
     tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
     Ok(Box::new(backend))
+}
+
+/// The vc-layout boot path: read the vc-stack layout, translate, and
+/// either emit-and-exit (returning None — the process should stop) or
+/// hand the boot the translated config's path plus the temp directory
+/// holding it. Runs on the blocking pool: startup-only file access.
+fn vc_layout_boot(
+    source: &str,
+    emit_out: Option<&str>,
+) -> anyhow::Result<Option<(String, std::path::PathBuf)>> {
+    let yaml = std::fs::read_to_string(source)
+        .with_context(|| format!("reading the vc layout {source}"))?;
+    let translation = siros_verifier_service::vc_layout::translate(&yaml)
+        .with_context(|| format!("translating the vc layout {source}"))?;
+    eprintln!(
+        "vc layout {source} translated ({} mapped, {} known-unsupported, {} notes):",
+        translation.report.mapped.len(),
+        translation.report.warned.len(),
+        translation.report.notes.len()
+    );
+    eprintln!("{}", translation.report);
+    if let Some(out) = emit_out {
+        let out = if out.is_empty() { "proxy.toml" } else { out };
+        std::fs::write(out, &translation.toml)
+            .with_context(|| format!("writing the translated config {out}"))?;
+        eprintln!("the translated proxy.toml is at {out}");
+        return Ok(None);
+    }
+    let dir = std::env::temp_dir().join(format!("siros-verifier-vc-layout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).with_context(|| "creating the translation directory")?;
+    let path = dir.join("proxy.toml");
+    std::fs::write(&path, &translation.toml).with_context(|| "writing the translated config")?;
+    Ok(Some((path.to_string_lossy().into_owned(), dir)))
 }
 
 /// The config file's directory: the base sibling paths (and relative
