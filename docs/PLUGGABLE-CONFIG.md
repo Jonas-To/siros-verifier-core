@@ -210,7 +210,8 @@ restart — the boot resolves fresh values.
 | Boot resolution (the provider selection point, both stores, the roster) | `service/src/main.rs` |
 | Generation-matched re-signing | `tunnelbana-plugin/src/lib.rs` (`with_previous_request_signers`) |
 | The rotation integration tests (public endpoints) | `tunnelbana-plugin/tests/request_rotation.rs` |
-| The user-facing reference | `docs/CONFIGURATION.md` — "Secrets and rotation" |
+| The vc-layout adapter (the vc-stack verifier's config.yaml → this service) | `service/src/vc_layout.rs` — the taxonomy, the translation, the report |
+| The user-facing reference | `docs/CONFIGURATION.md` — "Secrets and rotation", "Running from the vc-stack verifier's configuration layout" |
 
 The fail-fast rules are unit-tested at each layer: both sources for one
 value, a missing source, an empty source (env var and file alike), a

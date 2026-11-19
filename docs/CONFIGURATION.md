@@ -147,6 +147,24 @@ In a multi-replica deployment every replica must carry the same pair set through
 
 The state-encryption key rotates the same way through `previous_state_encryption_keys` (retained for decryption only, never for sealing).
 
+## Running from the vc-stack verifier's configuration layout
+
+A deployment already running the vc-stack verifier can point this service at the SAME configuration — the `common:` + `verifier:` `config.yaml`:
+
+```sh
+siros-verifier-service --from-vc-layout /etc/vc/config.yaml
+```
+
+The adapter translates that layout into this service's proxy.toml at boot (or with `--emit-toml <path>`, writes it for inspection and exits). The file paths carry over verbatim — the same volume mounts for the signing keys, the chains and the circuit artifacts serve the translated deployment — and the state secret reads the same `SIROS_VERIFIER_STATE_KEY` env var the deploy tooling already sets.
+
+Every member of the source document lands in one of three buckets, and the translation prints the report:
+
+- **mapped** — translated to its equivalent (the keys, the OP's client roster and TTLs, the presentation timeout, the PDP, the mongo URI, the presets, the nym-auth circuits, the registry mirrors, the WRPRC);
+- **known-unsupported** — a recognized vc-stack capability this service has no equivalent for (a warning naming the capability: ldp_vc, the OTLP export, the sidecar-rendered secrets file, TS12, pairwise subjects…);
+- **unknown** — a member the adapter does not know: either a typo or a NEW vc-stack feature that would otherwise silently vanish from the translated deployment. The translation refuses, naming the path.
+
+Two consequences the report always states: the OIDC OP moves from the verifier's root to `<base_url>/OIDC` (the RPs' discovery and token URLs must follow), and the derived defaults (the subject pointer, the go-trust role name, the flow store's database/collection) are the operator's to adjust.
+
 ## UI presets
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.

@@ -37,9 +37,70 @@ use tunnelbana_core::state::StateSealer;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/etc/siros-verifier/proxy.toml".to_string());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // The VC-layout adapter: `--from-vc-layout <config.yaml>` translates
+    // the vc-stack verifier's configuration into this service's
+    // proxy.toml. With `--emit-toml <path>` the translation is written
+    // (and the report printed) without starting the service — the
+    // operator-inspection mode; without it, the translated config boots
+    // the service directly, from a temp file the same boot path reads.
+    let (config_path, _vc_temp) = if let Some(index) =
+        args.iter().position(|a| a == "--from-vc-layout")
+    {
+        let source = args
+            .get(index + 1)
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "/etc/vc/config.yaml".to_string());
+        let yaml = std::fs::read_to_string(&source).unwrap_or_else(|e| {
+            eprintln!("failed to read the vc layout {source}: {e}");
+            std::process::exit(1);
+        });
+        let translation = siros_verifier_service::vc_layout::translate(&yaml).unwrap_or_else(|e| {
+            eprintln!("failed to translate the vc layout {source}: {e:#}");
+            std::process::exit(1);
+        });
+        eprintln!(
+            "vc layout {source} translated ({} mapped, {} known-unsupported, {} notes):",
+            translation.report.mapped.len(),
+            translation.report.warned.len(),
+            translation.report.notes.len()
+        );
+        eprintln!("{}", translation.report);
+        if let Some(emit) = args.iter().position(|a| a == "--emit-toml") {
+            let out = args
+                .get(emit + 1)
+                .cloned()
+                .unwrap_or_else(|| "proxy.toml".to_string());
+            std::fs::write(&out, &translation.toml).unwrap_or_else(|e| {
+                eprintln!("failed to write the translated config {out}: {e}");
+                std::process::exit(1);
+            });
+            eprintln!("the translated proxy.toml is at {out}");
+            std::process::exit(0);
+        }
+        let dir =
+            std::env::temp_dir().join(format!("siros-verifier-vc-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            eprintln!(
+                "failed to create the translation dir {}: {e}",
+                dir.display()
+            );
+            std::process::exit(1);
+        });
+        let path = dir.join("proxy.toml");
+        std::fs::write(&path, &translation.toml).unwrap_or_else(|e| {
+            eprintln!("failed to write the translated config: {e}");
+            std::process::exit(1);
+        });
+        (path.to_string_lossy().into_owned(), Some(dir))
+    } else {
+        (
+            args.first()
+                .cloned()
+                .unwrap_or_else(|| "/etc/siros-verifier/proxy.toml".to_string()),
+            None,
+        )
+    };
     let cfg = ProxyConfig::load(&config_path).unwrap_or_else(|e| {
         eprintln!("failed to load config {config_path}: {e}");
         std::process::exit(1);

@@ -9,3 +9,4 @@
 pub mod config;
 pub mod http;
 pub mod mongo_store;
+pub mod vc_layout;
