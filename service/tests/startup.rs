@@ -131,3 +131,82 @@ async fn builds_the_real_oidc_frontend_and_custom_backend() {
     let _ = std::fs::remove_dir_all(&dir);
     healthy.expect("service did not become healthy within 60 seconds");
 }
+
+/// A mismatched request-signing key/certificate-chain pair refuses the
+/// boot, naming both paths: the pair would otherwise pass every init
+/// step and only surface as signatures no wallet can verify.
+#[tokio::test]
+async fn a_mismatched_signing_key_and_chain_refuses_the_boot() {
+    let dir = std::env::temp_dir().join(format!(
+        "siros-verifier-service-mismatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Key A and certificate B: both well-formed, not a pair.
+    let key_a = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let key_b = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert_b = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
+        .unwrap()
+        .self_signed(&key_b)
+        .unwrap();
+    let (key_path, chain_path) = (dir.join("key.pem"), dir.join("chain.pem"));
+    std::fs::write(&key_path, key_a.serialize_pem()).unwrap();
+    std::fs::write(&chain_path, cert_b.pem()).unwrap();
+    let config_path = dir.join("proxy.toml");
+    let config = format!(
+        r#"
+        base_url = "https://verifier.example"
+        state_encryption_key = "a-32-byte-or-longer-test-secret!!"
+        cookie_secure = false
+
+        [[frontend]]
+        type = "ui"
+        name = "ui"
+
+        [[backend]]
+        type = "openid4vp"
+        name = "vp"
+          [backend.config]
+          request_signing_key_path = "{key}"
+          request_certificate_chain_path = "{chain}"
+          pdp_endpoint = "http://127.0.0.1:1/evaluation"
+          role = "pid-provider"
+          dcql = {{ credentials = [{{ id = "pid", format = "dc+sd-jwt",
+            claims = [{{ path = ["given_name"] }}] }}] }}
+          attribute_map = {{}}
+          subject_pointer = "/sub"
+
+          [backend.config.storage]
+          backend = "memory"
+    "#,
+        key = key_path.display(),
+        chain = chain_path.display()
+    );
+    std::fs::write(&config_path, config).unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_siros-verifier-service"))
+        .arg(&config_path)
+        .env("TUNNELBANA_BIND", "127.0.0.1:0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    // The refusal is fast: the pair check runs during backend assembly,
+    // long before the server binds.
+    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        .await
+        .expect("the boot terminates")
+        .expect("the boot terminates");
+    assert!(
+        !output.status.success(),
+        "a mismatched pair must refuse the boot"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not match the certificate chain leaf"),
+        "the refusal names the mismatch: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

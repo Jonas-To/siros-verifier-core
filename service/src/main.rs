@@ -14,7 +14,10 @@ use siros_verifier_core_tunnelbana::{
     system_clock, ui::UiFrontend, FlowStore, HttpPdp, MemoryFlowStore, PdpClient,
     ReqwestStatusListClient, TrustGate, VpBackend,
 };
-use siros_verifier_service::config::{DeploymentConfig, FlowStorageConfig, ZkpDeploymentConfig};
+use siros_verifier_service::config::{
+    ConfigClientRegistration, DeploymentConfig, FlowStorageConfig, PlatformSecretProvider,
+    SecretProvider, ZkpDeploymentConfig,
+};
 use siros_verifier_service::http::{self, ReqwestClient};
 use siros_verifier_service::mongo_store::{MongoFlowStore, MongoTokenUseStore};
 use siros_verifier_zkp::backend::{BackendRegistry, ProofBackend, SystemProfile};
@@ -120,10 +123,51 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
         previous_secrets: cfg.previous_state_encryption_keys.clone(),
     };
 
-    let token_use_store = build_token_use_store(&cfg).await?;
+    // The platform secret provider — the boot's one selection point. The
+    // service constructs the default (both platform channels: env vars
+    // and files under the config directory); an alternative provider
+    // (a k8s API watch, a Vault client) replaces this construction and
+    // everything downstream resolves through the trait unchanged.
+    let secrets: Arc<dyn SecretProvider> =
+        Arc::new(PlatformSecretProvider::new(config_dir(config_path)));
+
+    // The one deployment config parse and secret resolution, shared by
+    // both stores: the flow store and the token-use store consume the
+    // same resolved storage settings, so a `uri_env`/`uri_file`
+    // reference reaches both, never just one (which would boot the
+    // other on the unresolved raw config and refuse a present secret).
+    // Validate the shape first: tunnelbana's parser defaults an omitted
+    // `[[backend]]` to an empty vector, and indexing it would panic —
+    // refuse with the operator-facing message instead.
+    if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
+        bail!("exactly one backend of type openid4vp is required");
+    }
+    let mut deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
+    resolve_deployment_secrets(&mut deployment, secrets.as_ref())?;
+    let token_use_store = build_token_use_store(&deployment.storage).await?;
     let mut frontends = Vec::new();
     for p in &cfg.frontends {
-        let bx = make_ctx(&p.name, p.config_json());
+        let mut config = p.config_json();
+        if p.kind == "oidc" {
+            // Resolve the client roster's `_env` credential references
+            // through the platform secret provider (the SUNET/vc #935
+            // pattern): each entry names the env var its credential comes
+            // from, the provider resolves it at boot (fail-fast on a
+            // missing, empty or doubly-sourced value), and the strict
+            // downstream parser never sees the `_env` field — only the
+            // resolved `client_secret`. A k8s deployment backs the
+            // variable with a Secret's `secretKeyRef`.
+            if let Some(clients) = config.get_mut("clients").cloned() {
+                let raw = clients.as_array().cloned().ok_or_else(|| {
+                    anyhow!("frontend {}: clients must be a list of tables", p.name)
+                })?;
+                let resolved = ConfigClientRegistration::new(raw, secrets.clone())
+                    .clients()
+                    .map_err(|e| anyhow!("frontend {}: {} [{}]", p.name, e, e.code()))?;
+                config["clients"] = serde_json::Value::Array(resolved);
+            }
+        }
+        let bx = make_ctx(&p.name, config);
         if p.kind == "oidc" {
             if let Some(store) = &token_use_store {
                 frontends.push(
@@ -144,7 +188,7 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
         bail!("exactly one backend of type openid4vp is required");
     }
     let plugin = &cfg.backends[0];
-    let backend = build_openid4vp_backend(&cfg, plugin, config_path).await?;
+    let backend = build_openid4vp_backend(&cfg, plugin, config_path, deployment).await?;
     let backends = vec![backend];
     let mut microservices = Vec::new();
     for p in &cfg.microservices {
@@ -163,22 +207,16 @@ async fn build_proxy(cfg: ProxyConfig, config_path: &str) -> anyhow::Result<Prox
 }
 
 async fn build_token_use_store(
-    cfg: &ProxyConfig,
+    storage: &FlowStorageConfig,
 ) -> anyhow::Result<Option<Arc<dyn TokenUseStore>>> {
-    if cfg.backends.len() != 1 || cfg.backends[0].kind != "openid4vp" {
-        bail!("exactly one backend of type openid4vp is required");
-    }
-    let deployment: DeploymentConfig = serde_json::from_value(cfg.backends[0].config_json())?;
-    match deployment.storage.backend.as_str() {
+    match storage.backend.as_str() {
         "memory" => Ok(None),
         "mongodb" => {
-            let uri = deployment
-                .storage
+            let uri = storage
                 .uri
                 .as_deref()
                 .ok_or_else(|| anyhow!("MongoDB storage requires uri"))?;
-            let database = deployment
-                .storage
+            let database = storage
                 .database
                 .as_deref()
                 .ok_or_else(|| anyhow!("MongoDB storage requires database"))?;
@@ -230,6 +268,102 @@ async fn build_flow_store(config: &FlowStorageConfig) -> anyhow::Result<Arc<dyn 
     }
 }
 
+/// Resolve the deployment config's secret references at boot, through
+/// the platform secret provider: `_env` references through the
+/// environment (a k8s Secret's `secretKeyRef`, a Fly secret), `_file`
+/// references against the config file's directory (a Secret volume
+/// mount, materialized beside the config). Fail fast: a missing or
+/// empty source, or two sources named for one value, is a boot error
+/// naming the field and the source.
+///
+/// Mutates the config in place: the resolved value replaces the
+/// reference fields, which are cleared afterwards so a later reader
+/// cannot mistake a reference for a value.
+fn resolve_deployment_secrets(
+    deployment: &mut DeploymentConfig,
+    secrets: &dyn SecretProvider,
+) -> anyhow::Result<()> {
+    let resolve = |field: &str,
+                   inline: Option<&str>,
+                   env: Option<&str>,
+                   file: Option<&str>|
+     -> anyhow::Result<Option<String>> {
+        siros_verifier_core::config::resolve_secret_field(field, inline, env, file, secrets)
+            .map_err(|e| anyhow!("resolving {field}: {} [{}]", e, e.code()))
+    };
+    deployment.pdp_bearer_token = resolve(
+        "pdp_bearer_token",
+        deployment.pdp_bearer_token.as_deref(),
+        deployment.pdp_bearer_token_env.as_deref(),
+        deployment.pdp_bearer_token_file.as_deref(),
+    )?;
+    deployment.pdp_bearer_token_env = None;
+    deployment.pdp_bearer_token_file = None;
+    deployment.storage.uri = resolve(
+        "storage.uri",
+        deployment.storage.uri.as_deref(),
+        deployment.storage.uri_env.as_deref(),
+        deployment.storage.uri_file.as_deref(),
+    )?;
+    deployment.storage.uri_env = None;
+    deployment.storage.uri_file = None;
+    Ok(())
+}
+
+/// Load a request-signing key/chain pair from the configured paths: the
+/// PKCS#8 PEM, the DER certificate chain (leaf first), and the JWK (the
+/// current pair also derives the receipt key from the JWK's private
+/// scalar).
+async fn load_request_signing_pair(
+    config_path: &str,
+    key_path: &str,
+    chain_path: &str,
+) -> anyhow::Result<(kryptering::SoftwareSigner, Vec<Vec<u8>>, jose_rs::jwk::Jwk)> {
+    let key_full = resolve_sibling(config_path, key_path);
+    let key_read_path = key_full.clone();
+    let key_pem =
+        actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(key_read_path))
+            .await
+            .with_context(|| "joining the request signing key read task")?
+            .with_context(|| format!("reading request signing key {}", key_full.display()))?;
+    let mut jwk = jose_rs::jwk::jwk_from_pkcs8_pem(&key_pem)?;
+    jwk.alg = Some("ES256".into());
+    let signer = oid4vp::software_signer(&jwk)?;
+    let chain_full = resolve_sibling(config_path, chain_path);
+    let chain_read_path = chain_full.clone();
+    let chain_pem =
+        actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(chain_read_path))
+            .await
+            .with_context(|| "joining the certificate chain read task")?
+            .with_context(|| format!("reading certificate chain {}", chain_full.display()))?;
+    let chain_der: Vec<Vec<u8>> = pem::parse_many(chain_pem)?
+        .into_iter()
+        .filter(|block| block.tag() == "CERTIFICATE")
+        .map(|block| block.into_contents())
+        .collect();
+    if chain_der.is_empty() {
+        bail!("certificate chain {chain_path} is empty");
+    }
+    // The key must be the chain leaf's key: a mismatched pair would pass
+    // every later init step and only surface as signatures no wallet can
+    // verify. Refuse it here, naming both paths — the same fail-fast
+    // posture the WRPRC validation has. The thumbprint covers the public
+    // members only, so the private JWK and the leaf's public JWK
+    // thumbprint identically when (and only when) they are the same key.
+    let key_thumbprint = jose_rs::jwk::thumbprint::thumbprint_sha256(&jwk)
+        .with_context(|| "thumbprinting the request signing key")?;
+    let leaf_jwk = siros_verifier_core::sdjwt::jwk_from_cert_der(&chain_der[0])
+        .with_context(|| "extracting the chain leaf's public key")?;
+    let leaf_thumbprint = jose_rs::jwk::thumbprint::thumbprint_sha256(&leaf_jwk)
+        .with_context(|| "thumbprinting the chain leaf")?;
+    if key_thumbprint != leaf_thumbprint {
+        bail!(
+            "the request signing key {key_path} does not match the certificate chain leaf in {chain_path} — a mismatched pair signs requests no wallet can verify"
+        );
+    }
+    Ok((signer, chain_der, jwk))
+}
+
 fn build_zkp_verifier(config: &ZkpDeploymentConfig) -> anyhow::Result<ZkpVerifier> {
     let allowlist = Allowlist::new(&config.circuits).map_err(|e| anyhow!(e))?;
     let mut backends = BackendRegistry::new();
@@ -278,18 +412,15 @@ async fn build_openid4vp_backend(
     cfg: &ProxyConfig,
     plugin: &tunnelbana_core::config::PluginConfig,
     config_path: &str,
+    mut deployment: DeploymentConfig,
 ) -> anyhow::Result<Box<dyn tunnelbana_core::plugin::Backend>> {
-    let mut deployment: DeploymentConfig = serde_json::from_value(plugin.config_json())?;
-    let key_path = resolve_sibling(config_path, &deployment.request_signing_key_path);
     // Startup-only reads, kept off the async runtime's worker threads.
-    let key_read_path = key_path.clone();
-    let key_pem =
-        actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(key_read_path))
-            .await
-            .with_context(|| "joining the request signing key read task")?
-            .with_context(|| format!("reading request signing key {}", key_path.display()))?;
-    let mut request_jwk = jose_rs::jwk::jwk_from_pkcs8_pem(&key_pem)?;
-    request_jwk.alg = Some("ES256".into());
+    let (request_signer, chain_der, request_jwk) = load_request_signing_pair(
+        config_path,
+        &deployment.request_signing_key_path,
+        &deployment.request_certificate_chain_path,
+    )
+    .await?;
     let private_scalar = request_jwk
         .d
         .as_deref()
@@ -297,25 +428,29 @@ async fn build_openid4vp_backend(
     let receipt_key = p256::ecdsa::SigningKey::from_slice(
         &jose_rs::base64url::decode(private_scalar).context("decoding receipt signing scalar")?,
     )?;
-    let request_signer = oid4vp::software_signer(&request_jwk)?;
 
-    let chain_path = resolve_sibling(config_path, &deployment.request_certificate_chain_path);
-    let chain_read_path = chain_path.clone();
-    let chain_pem =
-        actix_web::rt::task::spawn_blocking(move || std::fs::read_to_string(chain_read_path))
-            .await
-            .with_context(|| "joining the request certificate chain read task")?
-            .with_context(|| {
-                format!("reading request certificate chain {}", chain_path.display())
-            })?;
-    let chain_der: Vec<Vec<u8>> = pem::parse_many(chain_pem)?
-        .into_iter()
-        .filter(|block| block.tag() == "CERTIFICATE")
-        .map(|block| block.into_contents())
-        .collect();
-    if chain_der.is_empty() {
-        bail!("request certificate chain is empty");
-    }
+    // The rotation window: a previous request-signing key/chain pair is
+    // retained so in-flight flows (created under the old key, re-signed
+    // when `request_uri_method = "post"` echoes a wallet_nonce) complete
+    // under the generation they started with. New flows always use the
+    // current pair. Both paths must be set together; the retention
+    // window is bounded by `request_ttl_secs`, so the pair is dropped
+    // from the config once every pre-rotation flow has expired.
+    let previous_pair = match (
+        &deployment.previous_request_signing_key_path,
+        &deployment.previous_request_certificate_chain_path,
+    ) {
+        (Some(key), Some(chain)) => {
+            let (signer, chain_der, _) =
+                load_request_signing_pair(config_path, key, chain).await?;
+            tracing::info!(name = %plugin.name, "retained a previous request-signing key for the rotation window");
+            Some((signer, chain_der))
+        }
+        (None, None) => None,
+        _ => bail!(
+            "previous_request_signing_key_path and previous_request_certificate_chain_path must be set together"
+        ),
+    };
 
     // Increment 2 (#39): the intermediary deployment's EAAP members. The
     // WRPRC is the FRONTED relying party's registration certificate; the
@@ -449,6 +584,12 @@ async fn build_openid4vp_backend(
             system_clock(),
         )?
     };
+    // The rotation window's retained pair, validated (distinct leaves)
+    // by the builder.
+    let backend = match previous_pair {
+        Some(previous) => backend.with_previous_request_signers(vec![previous])?,
+        None => backend,
+    };
     let status_list_client = if deployment.allow_invalid_status_list_certificates {
         ReqwestStatusListClient::new_allow_invalid_certificates_for_testing(
             std::time::Duration::from_secs(5),
@@ -463,6 +604,15 @@ async fn build_openid4vp_backend(
         .with_status_list_client(Arc::new(status_list_client));
     tracing::info!(name = %plugin.name, pdp = %deployment.pdp_endpoint, storage = %deployment.storage.backend, "loaded OpenID4VP backend");
     Ok(Box::new(backend))
+}
+
+/// The config file's directory: the base sibling paths (and relative
+/// `_file` secret references) resolve against.
+fn config_dir(config_path: &str) -> std::path::PathBuf {
+    std::path::Path::new(config_path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
 fn resolve_sibling(config_path: &str, rel: &str) -> std::path::PathBuf {

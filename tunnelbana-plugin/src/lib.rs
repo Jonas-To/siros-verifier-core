@@ -1015,6 +1015,13 @@ pub struct VpBackend {
     gate: TrustGate,
     signer: kryptering::SoftwareSigner,
     chain_der: Vec<Vec<u8>>,
+    /// Retained previous request-signing key/chain generations, most
+    /// recent rotation first. In-flight flows created before a rotation
+    /// are re-signed (`request_uri_method = "post"`) by the pair they
+    /// were created under — the re-issued request must carry the chain
+    /// its `client_id` hashes from. New flows always use the current
+    /// pair. The retention window is bounded by `request_ttl_secs`.
+    previous_signers: Vec<(kryptering::SoftwareSigner, Vec<Vec<u8>>)>,
     clock: Clock,
     status_list_client: Option<Arc<dyn StatusListClient>>,
     /// Optional `zkp_req` support. Each flow selects its format from its DCQL.
@@ -1419,6 +1426,7 @@ impl VpBackend {
             gate,
             signer,
             chain_der,
+            previous_signers: Vec::new(),
             clock,
             status_list_client: None,
             zkp: None,
@@ -1528,6 +1536,62 @@ impl VpBackend {
     pub fn with_status_list_client(mut self, client: Arc<dyn StatusListClient>) -> Self {
         self.status_list_client = Some(client);
         self
+    }
+
+    /// Retain previous request-signing key/chain generations for a rotation
+    /// window (most recent first). In-flight flows are re-signed by the pair
+    /// they were created under; new flows always use the current pair. Each
+    /// previous chain must be non-empty, and its leaf must differ from the
+    /// current leaf and every other previous leaf — matching a flow to its
+    /// generation is by leaf, so a duplicate would be ambiguous.
+    pub fn with_previous_request_signers(
+        mut self,
+        previous: Vec<(kryptering::SoftwareSigner, Vec<Vec<u8>>)>,
+    ) -> Result<Self> {
+        let current_leaf = self.chain_der.first();
+        let mut leaves: Vec<&Vec<u8>> = current_leaf.into_iter().collect();
+        for (i, (_, chain)) in previous.iter().enumerate() {
+            let leaf = chain.first().ok_or_else(|| {
+                Error::Config(format!(
+                    "previous request-signing key {i}: the certificate chain is empty"
+                ))
+            })?;
+            if leaves.contains(&leaf) {
+                return Err(Error::Config(format!(
+                    "previous request-signing key {i}: its chain leaf duplicates the current or an earlier previous chain — a flow could not be matched to one generation"
+                )));
+            }
+            leaves.push(leaf);
+        }
+        self.previous_signers = previous;
+        Ok(self)
+    }
+
+    /// The signing pair a stored flow's request object belongs to: the
+    /// generation whose chain leaf matches the stored JAR's `x5c` leaf.
+    /// A stored JAR this backend did not build carries no `x5c`; the
+    /// current pair re-signs it (and embeds the current chain), matching
+    /// the pre-rotation behavior.
+    fn signer_generation_for(
+        &self,
+        jar: &str,
+    ) -> Result<(&kryptering::SoftwareSigner, &[Vec<u8>])> {
+        let leaf =
+            oid4vp::request_object_chain_leaf(jar).map_err(|e| Error::BadRequest(e.to_string()))?;
+        let Some(leaf) = leaf else {
+            return Ok((&self.signer, &self.chain_der));
+        };
+        if self.chain_der.first().is_some_and(|der| *der == leaf) {
+            return Ok((&self.signer, &self.chain_der));
+        }
+        for (signer, chain) in &self.previous_signers {
+            if chain.first().is_some_and(|der| *der == leaf) {
+                return Ok((signer, chain));
+            }
+        }
+        Err(Error::BadRequest(
+            "the flow's request object matches no active request-signing key generation — its rotation window has passed".into(),
+        ))
     }
 
     fn flow_id_from_path(&self, ctx: &Context, prefix: &str) -> Result<String> {
@@ -2696,11 +2760,17 @@ impl Backend for VpBackend {
                         response.status = 400;
                         return Ok(BackendAction::Respond(response));
                     }
+                    // Rotation: re-sign by the generation the flow was
+                    // created under — the re-issued request must carry the
+                    // same chain its client_id hashes from, so a flow
+                    // created before a key rotation is completed with the
+                    // previous pair, not the current one.
+                    let (signer, chain) = self.signer_generation_for(&jar)?;
                     jar = oid4vp::reissue_request_with_wallet_nonce(
                         &jar,
                         &nonce.unwrap_or_default(),
-                        &self.signer,
-                        &self.chain_der,
+                        signer,
+                        chain,
                     )
                     .map_err(|e| Error::BadRequest(e.to_string()))?;
                 }
