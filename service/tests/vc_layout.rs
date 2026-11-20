@@ -508,6 +508,19 @@ fn the_fallback_dcql_requests_the_subject_identifier() {
         pid_paths.contains(&"personal_administrative_number".to_string()),
         "the named scope's query requests the identifier claim (paths: {pid_paths:?})"
     );
+    // The subject query is FIRST: the runtime's merge takes the first
+    // credential carrying the claim, so the diploma's own claim of the
+    // same name must never precede the selected PID's.
+    let first_id = credentials[0]
+        .as_table()
+        .unwrap()
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(
+        first_id, "pid_eudi",
+        "the subject scope's query leads the fallback (first: {first_id})"
+    );
     let diploma_paths = paths_for("diploma");
     assert!(
         !diploma_paths.contains(&"personal_administrative_number".to_string()),

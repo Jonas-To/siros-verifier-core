@@ -1216,6 +1216,7 @@ fn emit_fallback_dcql(
     let metadata = &cfg.common.credential_metadata;
     let mut credentials: Vec<toml::Value> = Vec::new();
     let mut subject_claim: Option<String> = None;
+    let mut subject_index: Option<usize> = None;
     let subject_scope_name = subject_scope.map(str::to_string);
     // The identifier's claim path, as a DCQL claims entry.
     let segments: Vec<toml::Value> = subject_pointer
@@ -1265,6 +1266,7 @@ fn emit_fallback_dcql(
         };
         if subject_query {
             subject_claim = Some(scope.clone());
+            subject_index = Some(credentials.len());
             if let Some(claims) = query.get_mut("claims").and_then(|c| c.as_array_mut()) {
                 claims.push(toml::Value::Table(subject_claim_path.clone()));
             } else {
@@ -1285,6 +1287,14 @@ fn emit_fallback_dcql(
         return Err(anyhow!(
             "--subject-scope {scope} does not resolve to an emitted fallback query — the scope is not among supported_credentials, or its format is not supported"
         ));
+    }
+    // The subject query goes FIRST: the runtime's merge takes the
+    // first credential carrying the claim, and a differently-ordered
+    // credential with the same claim name would otherwise supply the
+    // subject (a diploma's `sub` instead of the selected PID's).
+    if let Some(index) = subject_index.filter(|i| *i > 0) {
+        let query = credentials.remove(index);
+        credentials.insert(0, query);
     }
     let mut dcql = toml::Table::new();
     dcql.insert("credentials".into(), toml::Value::Array(credentials));

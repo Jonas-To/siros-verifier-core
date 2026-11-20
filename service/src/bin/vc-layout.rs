@@ -131,46 +131,53 @@ fn main() {
             // destination, so no interval exists with a permissive
             // file, and a pre-existing permissive output is replaced
             // atomically.
-            // A UNIQUE temp per attempt: an interrupted run's stale
-            // sibling (the emptyDir survives container restarts) never
-            // blocks a retry — each attempt gets its own, still created
-            // exclusively at 0600.
-            let temp = format!("{path}.tmp.{}", std::process::id());
-            let mut created = false;
-            let write_result = (|| {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    // create_new: EXCLUSIVE creation — an existing file
-                    // (or a symlink at the temp path) fails instead of
-                    // being reused or followed. A failed open means the
-                    // file was never ours; only the flag's being set
-                    // marks the temp as this invocation's own.
-                    let mut file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&temp)?;
-                    created = true;
-                    std::io::Write::write_all(&mut file, translation.toml.as_bytes())?;
-                }
-                #[cfg(not(unix))]
-                {
-                    // The non-unix fallback: refuse an existing temp
-                    // rather than reusing it.
-                    if std::path::Path::new(&temp).exists() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!("{temp} already exists"),
-                        ));
+            // A UNIQUE temp per attempt, and the pid alone is not
+            // unique here: an initContainer's restarts all run as PID 1,
+            // so a stale sibling from an interrupted attempt would block
+            // every retry at create_new. Fresh suffixes until an
+            // exclusive 0600 creation succeeds; cleanup removes only
+            // what this invocation created.
+            let mut created: Option<String> = None;
+            let write_result = (|| -> std::io::Result<()> {
+                for attempt in 0..64 {
+                    let temp = format!("{path}.tmp.{}-{attempt}", std::process::id());
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        // create_new: EXCLUSIVE — an existing file (or a
+                        // symlink at the temp path) fails instead of
+                        // being reused or followed.
+                        let mut file = match std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(&temp)
+                        {
+                            Ok(file) => file,
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                            Err(e) => return Err(e),
+                        };
+                        created = Some(temp.clone());
+                        std::io::Write::write_all(&mut file, translation.toml.as_bytes())?;
+                        return std::fs::rename(&temp, &path);
                     }
-                    std::fs::write(&temp, &translation.toml)?;
-                    created = true;
+                    #[cfg(not(unix))]
+                    {
+                        if std::path::Path::new(&temp).exists() {
+                            continue;
+                        }
+                        std::fs::write(&temp, &translation.toml)?;
+                        created = Some(temp.clone());
+                        return std::fs::rename(&temp, &path);
+                    }
                 }
-                std::fs::rename(&temp, &path)
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "no fresh temporary name available after 64 attempts",
+                ))
             })();
             if let Err(e) = write_result {
-                if created {
+                if let Some(temp) = created {
                     let _ = std::fs::remove_file(&temp);
                 }
                 eprintln!("writing {path}: {e}");
