@@ -565,3 +565,21 @@ fn the_tool_writes_a_reviewable_artifact() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_subject_scope_without_an_emitted_query_refuses() {
+    // A named scope that does not resolve to an emitted fallback query
+    // (not among supported_credentials, or dropped for its format)
+    // would leave the fallback without the subject identifier — refuse
+    // rather than emit a config whose OP logins fail late.
+    let mut options = full_gdc_options();
+    options.subject_scope = Some("no_such_credential".into());
+    let err = match translate_gdc_with(&options) {
+        Ok(_) => panic!("an unresolvable subject scope must refuse"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("no_such_credential"),
+        "the refusal names the scope: {err:#}"
+    );
+}

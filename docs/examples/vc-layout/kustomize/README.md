@@ -6,6 +6,16 @@ The vc `config.yaml` is then retired — the emitted proxy.toml IS the
 config, and the report (checked in beside it) documents every decision
 it embodies.
 
+**Before committing: move the credentials out of the artifact.** The
+vc config commonly embeds them (the mongo URI carries its password
+inline) and mode 0600 does not protect a secret in Git. Replace the
+inline values with this service's `_env` references before staging —
+the emitted `storage.uri` becomes `storage.uri_env = "VC_MONGODB_URI"`
+wired from a Kubernetes Secret, and any client secret becomes
+`client_secret_env` — then commit the reference-bearing config and keep
+the signing private keys out of the committed base entirely (the
+secretGenerator below mounts them at runtime).
+
 ```sh
 # Once, at migration time:
 vc-layout config.yaml -o base/siros-verifier/proxy.toml \
@@ -60,7 +70,8 @@ spec:
 
 Overlays patch it like any other config: `patches` for the image, the
 replicas, the env — the translated proxy.toml itself is diffed and
-reviewed in git like the rest of the base.
+reviewed in git like the rest of the base (the credentials having been
+moved to Secret-wired `_env` references, the diff carries none).
 
 **Regenerating:** a vc config change means re-running the tool and
 reviewing the diff — including any NEW member the tool refuses (an

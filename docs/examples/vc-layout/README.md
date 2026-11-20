@@ -8,8 +8,14 @@ what the operator must decide), and take the emitted proxy.toml as the
 starting point for the deployment's own config management.
 
 ```sh
-docker run --rm -v "$PWD:/work" ghcr.io/sirosfoundation/siros-verifier-core \
-  /usr/local/bin/vc-layout /work/config.yaml -o /work/proxy.toml \
+# --entrypoint overrides the image's service entrypoint (without it the
+# tool's path would become the service's config filename); --user gives
+# the container write access to the bind-mounted working directory.
+docker run --rm \
+  --entrypoint /usr/local/bin/vc-layout \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD:/work" ghcr.io/sirosfoundation/siros-verifier-core \
+  /work/config.yaml -o /work/proxy.toml \
   --allow-insecure-pdp \
   --subject-pointer /personal_administrative_number \
   --subject-scope pid_eudi

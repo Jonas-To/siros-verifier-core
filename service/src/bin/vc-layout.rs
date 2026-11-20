@@ -33,7 +33,13 @@ fn main() {
         match arg.as_str() {
             "-o" | "--output" => {
                 i += 1;
-                output = args.get(i).cloned();
+                output = match args.get(i) {
+                    Some(path) => Some(path.clone()),
+                    None => {
+                        eprintln!("-o/--output needs a filename\n\n{HELP}");
+                        std::process::exit(2);
+                    }
+                };
             }
             "--allow-insecure-pdp" => options.allow_insecure_pdp = true,
             "--subject-pointer" => {
@@ -67,7 +73,18 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let source_dir = std::path::Path::new(&source)
+    // Absolute before the parent is taken: a relative source path
+    // (deploy/config.yaml) must not leave source_dir relative — the
+    // translated file members would resolve against the wrong base
+    // when the output lands elsewhere.
+    let source_abs = if std::path::Path::new(&source).is_absolute() {
+        source.clone()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&source).to_string_lossy().into_owned())
+            .unwrap_or_else(|_| source.clone())
+    };
+    let source_dir = std::path::Path::new(&source_abs)
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -93,20 +110,34 @@ fn main() {
     match output {
         Some(path) => {
             // The emitted config can carry credentials (the mongo URI
-            // embeds them) — owner-only.
-            if let Err(e) = std::fs::write(&path, &translation.toml) {
+            // embeds them) — owner-only FROM CREATION: a private
+            // temporary is created at mode 0600 and renamed over the
+            // destination, so no interval exists with a permissive
+            // file, and a pre-existing permissive output is replaced
+            // atomically.
+            let temp = format!("{path}.tmp");
+            let write_result = (|| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&temp)?;
+                    std::io::Write::write_all(&mut file, translation.toml.as_bytes())?;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::fs::write(&temp, &translation.toml)?;
+                }
+                std::fs::rename(&temp, &path)
+            })();
+            if let Err(e) = write_result {
+                let _ = std::fs::remove_file(&temp);
                 eprintln!("writing {path}: {e}");
                 std::process::exit(1);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                {
-                    eprintln!("restricting {path} to owner-only: {e}");
-                    std::process::exit(1);
-                }
             }
             eprintln!("the translated proxy.toml is at {path}");
         }

@@ -47,11 +47,21 @@ metadata:
 spec:
   template:
     spec:
+      # Both containers run as the image's UID 10001; fsGroup makes the
+      # fresh emptyDir writable by it (the tool writes the 0600 output
+      # there, and the service reads it as the same user).
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 10001
       # The translation step: one container's work, before the service.
       initContainers:
         - name: translate-vc-layout
           image: ghcr.io/sirosfoundation/siros-verifier-core:v0.1.9
           command: ["/usr/local/bin/vc-layout"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
           args:
             - /vc/config.yaml
             - -o
@@ -69,6 +79,10 @@ spec:
         - name: verifier
           image: ghcr.io/sirosfoundation/siros-verifier-core:v0.1.9
           args: ["/etc/siros-verifier/proxy.toml"]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
           ports: [{ containerPort: 9001 }]
           env:
             - name: SIROS_VERIFIER_STATE_KEY

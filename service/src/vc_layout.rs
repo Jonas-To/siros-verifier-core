@@ -1186,7 +1186,7 @@ fn emit_backend(
             report,
             &subject_pointer,
             context.options.subject_scope.as_deref(),
-        )),
+        )?),
     );
     bconfig.insert(
         "attribute_map".into(),
@@ -1212,7 +1212,7 @@ fn emit_fallback_dcql(
     report: &mut Report,
     subject_pointer: &str,
     subject_scope: Option<&str>,
-) -> toml::Table {
+) -> Result<toml::Table> {
     let metadata = &cfg.common.credential_metadata;
     let mut credentials: Vec<toml::Value> = Vec::new();
     let mut subject_claim: Option<String> = None;
@@ -1276,6 +1276,16 @@ fn emit_fallback_dcql(
         }
         credentials.push(toml::Value::Table(query));
     }
+    // An explicitly named scope must resolve to an EMITTED query: a
+    // scope that does not exist, or one dropped for a missing metadata
+    // entry or an unsupported format, would leave the fallback without
+    // the subject identifier — a presentation without the claim would
+    // pass verification and fail at the subject.
+    if let (Some(scope), None) = (&subject_scope_name, &subject_claim) {
+        return Err(anyhow!(
+            "--subject-scope {scope} does not resolve to an emitted fallback query — the scope is not among supported_credentials, or its format is not supported"
+        ));
+    }
     let mut dcql = toml::Table::new();
     dcql.insert("credentials".into(), toml::Value::Array(credentials));
     if subject_claim.is_some() {
@@ -1283,7 +1293,7 @@ fn emit_fallback_dcql(
             "--subject-pointer -> backend.config.dcql[0].claims — the fallback requests the subject identifier",
         );
     }
-    dcql
+    Ok(dcql)
 }
 
 /// The storage: the vc mongo URI carries verbatim (its own credentials
