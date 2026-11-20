@@ -116,26 +116,43 @@ fn main() {
             // file, and a pre-existing permissive output is replaced
             // atomically.
             let temp = format!("{path}.tmp");
+            let mut created = false;
             let write_result = (|| {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::OpenOptionsExt;
+                    // create_new: EXCLUSIVE creation — an existing file
+                    // (or a symlink at the temp path) fails instead of
+                    // being reused or followed. A failed open means the
+                    // file was never ours; only the flag's being set
+                    // marks the temp as this invocation's own.
                     let mut file = std::fs::OpenOptions::new()
                         .write(true)
-                        .create(true)
-                        .truncate(true)
+                        .create_new(true)
                         .mode(0o600)
                         .open(&temp)?;
+                    created = true;
                     std::io::Write::write_all(&mut file, translation.toml.as_bytes())?;
                 }
                 #[cfg(not(unix))]
                 {
+                    // The non-unix fallback: refuse an existing temp
+                    // rather than reusing it.
+                    if std::path::Path::new(&temp).exists() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!("{temp} already exists"),
+                        ));
+                    }
                     std::fs::write(&temp, &translation.toml)?;
+                    created = true;
                 }
                 std::fs::rename(&temp, &path)
             })();
             if let Err(e) = write_result {
-                let _ = std::fs::remove_file(&temp);
+                if created {
+                    let _ = std::fs::remove_file(&temp);
+                }
                 eprintln!("writing {path}: {e}");
                 std::process::exit(1);
             }
