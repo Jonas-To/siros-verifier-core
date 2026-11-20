@@ -8,6 +8,10 @@ authors.workspace = true
 description = "Actix/OpenID Connect gateway for the SIROS verifier core"
 publish = false
 
+[[bin]]
+name = "vc-layout"
+path = "src/bin/vc-layout.rs"
+
 [dependencies]
 # HTTP/1.1 only: Fly terminates TLS and the service does not need actix's
 # default HTTP/2 stack (currently h2 0.3, RUSTSEC-2026-0258).
