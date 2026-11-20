@@ -615,6 +615,15 @@ pub struct TranslateOptions {
     /// without an explicit mapping. Absent an OP, the backend's own
     /// subject pointer defaults to the common PID family_name.
     pub subject_pointer: Option<String>,
+    /// The supported credential whose fallback query carries the
+    /// subject identifier's claim (`--subject-scope`). REQUIRED with a
+    /// subject pointer when the layout supports more than one
+    /// credential: the claim must ride a query the credential can
+    /// actually fulfill (a PAN belongs on a PID query, not a
+    /// diploma's — an unfulfillable claim would break every OP
+    /// login). Defaults to the first supported credential, which is
+    /// only right when there is exactly one.
+    pub subject_scope: Option<String>,
 }
 
 impl std::fmt::Display for Report {
@@ -704,7 +713,7 @@ fn emit(
     let mut root = toml::Table::new();
     root.insert(
         "base_url".into(),
-        toml::Value::String(emit_identity(cfg, report, context)),
+        toml::Value::String(emit_identity(cfg, report)),
     );
     emit_cookies(cfg, &mut root, report);
     emit_logging(cfg, &mut root);
@@ -725,7 +734,7 @@ fn emit(
 /// verifier's own root; tunnelbana serves the OP under its frontend
 /// module path — the issuer URL MOVES, and the RPs' discovery URL
 /// follows. The report says so.
-fn emit_identity(cfg: &VcConfig, report: &mut Report, context: &mut TranslateContext) -> String {
+fn emit_identity(cfg: &VcConfig, report: &mut Report) -> String {
     let base_url = cfg.verifier.public_url.trim_end_matches('/').to_string();
     if let Some(oidc) = cfg.verifier.outbound.oidc_provider.as_ref() {
         if let Some(issuer) = oidc.issuer.as_deref() {
@@ -739,23 +748,19 @@ fn emit_identity(cfg: &VcConfig, report: &mut Report, context: &mut TranslateCon
     report.note(format!(
         "the OIDC OP moves from the verifier root to {base_url}/OIDC — the RPs' discovery and token URLs must follow (the emitted frontend advertises its own module base)"
     ));
-    // The vc api_server.addr becomes the boot's bind hint (the Go form
-    // ":8080" means all interfaces); an explicit TUNNELBANA_BIND wins.
+    // The layout's api_server.addr names the bind the vc service used
+    // (":8080" — the Go form — means all interfaces); this service's
+    // bind comes from its own TUNNELBANA_BIND, and the operator's
+    // rewritten templating states it there.
     if let Some(addr) = cfg
         .verifier
         .api_server
         .as_ref()
         .and_then(|a| a.addr.clone())
     {
-        let bind = if let Some(port) = addr.strip_prefix(':') {
-            format!("0.0.0.0:{port}")
-        } else {
-            addr.clone()
-        };
         report.note(format!(
-            "verifier.api_server.addr {addr} — the service binds {bind} (an explicit TUNNELBANA_BIND overrides it)"
+            "verifier.api_server.addr {addr} — the bind is this service's own (TUNNELBANA_BIND); state it in the deployment's templating"
         ));
-        context.bind_hint = Some(bind);
     }
     base_url
 }
@@ -948,6 +953,21 @@ fn emit_oidc_frontend(
             "verifier.outbound.oidc_provider is enabled but the vc layout names no subject member — pass --subject-pointer with a UNIQUE identifier claim (two holders sharing a name would share a subject)"
         )
     })?;
+    // With more than one supported credential, the claim must ride the
+    // scope the operator names — the first supported credential is only
+    // right when there is exactly one.
+    let supported_count = cfg
+        .verifier
+        .inbound
+        .openid4vp
+        .iter()
+        .flat_map(|o| o.supported_credentials.iter())
+        .count();
+    if supported_count > 1 && context.options.subject_scope.is_none() {
+        return Err(anyhow!(
+            "the layout supports {supported_count} credentials — pass --subject-scope naming the credential whose query carries the subject identifier ({subject_pointer}); the first supported credential would only be right if there were exactly one"
+        ));
+    }
     report.mapped(format!(
         "--subject-pointer {subject_pointer} -> the OP's subject identifier"
     ));
@@ -1161,7 +1181,12 @@ fn emit_backend(
     }
     bconfig.insert(
         "dcql".into(),
-        toml::Value::Table(emit_fallback_dcql(cfg, report, &subject_pointer)),
+        toml::Value::Table(emit_fallback_dcql(
+            cfg,
+            report,
+            &subject_pointer,
+            context.options.subject_scope.as_deref(),
+        )?),
     );
     bconfig.insert(
         "attribute_map".into(),
@@ -1182,10 +1207,17 @@ fn emit_backend(
 /// The fallback DCQL: one entry per supported credential whose format
 /// this service speaks. Claims stay deliberately empty (the
 /// mandatory-only request); the presets carry the real queries.
-fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report, subject_pointer: &str) -> toml::Table {
+fn emit_fallback_dcql(
+    cfg: &VcConfig,
+    report: &mut Report,
+    subject_pointer: &str,
+    subject_scope: Option<&str>,
+) -> Result<toml::Table> {
     let metadata = &cfg.common.credential_metadata;
     let mut credentials: Vec<toml::Value> = Vec::new();
     let mut subject_claim: Option<String> = None;
+    let mut subject_index: Option<usize> = None;
+    let subject_scope_name = subject_scope.map(str::to_string);
     // The identifier's claim path, as a DCQL claims entry.
     let segments: Vec<toml::Value> = subject_pointer
         .trim_start_matches('/')
@@ -1224,12 +1256,17 @@ fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report, subject_pointer: &str
                 continue;
             }
         };
-        // The OP's OIDC logins ride this fallback — the FIRST supported
-        // credential's query must request the identifier the subject
-        // derives from, or a wallet omitting it passes verification and
-        // fails at the subject claim. Only the first query carries it.
-        if subject_claim.is_none() {
+        // The OP's OIDC logins ride this fallback — the subject
+        // identifier's claim must ride a query the credential can
+        // FULFILL: the operator names the scope; the first supported
+        // credential is only right when there is exactly one.
+        let subject_query = match &subject_scope_name {
+            Some(want) => scope == want,
+            None => subject_claim.is_none(),
+        };
+        if subject_query {
             subject_claim = Some(scope.clone());
+            subject_index = Some(credentials.len());
             if let Some(claims) = query.get_mut("claims").and_then(|c| c.as_array_mut()) {
                 claims.push(toml::Value::Table(subject_claim_path.clone()));
             } else {
@@ -1241,6 +1278,24 @@ fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report, subject_pointer: &str
         }
         credentials.push(toml::Value::Table(query));
     }
+    // An explicitly named scope must resolve to an EMITTED query: a
+    // scope that does not exist, or one dropped for a missing metadata
+    // entry or an unsupported format, would leave the fallback without
+    // the subject identifier — a presentation without the claim would
+    // pass verification and fail at the subject.
+    if let (Some(scope), None) = (&subject_scope_name, &subject_claim) {
+        return Err(anyhow!(
+            "--subject-scope {scope} does not resolve to an emitted fallback query — the scope is not among supported_credentials, or its format is not supported"
+        ));
+    }
+    // The subject query goes FIRST: the runtime's merge takes the
+    // first credential carrying the claim, and a differently-ordered
+    // credential with the same claim name would otherwise supply the
+    // subject (a diploma's `sub` instead of the selected PID's).
+    if let Some(index) = subject_index.filter(|i| *i > 0) {
+        let query = credentials.remove(index);
+        credentials.insert(0, query);
+    }
     let mut dcql = toml::Table::new();
     dcql.insert("credentials".into(), toml::Value::Array(credentials));
     if subject_claim.is_some() {
@@ -1248,7 +1303,7 @@ fn emit_fallback_dcql(cfg: &VcConfig, report: &mut Report, subject_pointer: &str
             "--subject-pointer -> backend.config.dcql[0].claims — the fallback requests the subject identifier",
         );
     }
-    dcql
+    Ok(dcql)
 }
 
 /// The storage: the vc mongo URI carries verbatim (its own credentials

@@ -14,6 +14,10 @@ RUN apk add --no-cache ca-certificates curl \
     && addgroup -g 10001 -S siros \
     && adduser -u 10001 -G siros -S -H siros
 COPY --from=build /src/target/release/siros-verifier-service /usr/local/bin/siros-verifier-service
+# The vc-layout migration tool rides the same image: k8s deployments run
+# it as an initContainer (config in, translated proxy.toml out) without
+# needing a second artifact.
+COPY --from=build /src/target/release/vc-layout /usr/local/bin/vc-layout
 COPY --from=build /etc/siros-verifier/circuits/nymauth-mdoc.bin /etc/siros-verifier/circuits/nymauth-mdoc.bin
 ENV TUNNELBANA_BIND=0.0.0.0:9001
 # Numeric UID/GID: the container runs unprivileged, and orchestrators can

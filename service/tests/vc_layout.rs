@@ -35,6 +35,9 @@ fn full_gdc_options() -> siros_verifier_service::vc_layout::TranslateOptions {
     siros_verifier_service::vc_layout::TranslateOptions {
         allow_insecure_pdp: true,
         subject_pointer: Some("/personal_administrative_number".into()),
+        // The PAN belongs on a PID query, not the first supported
+        // credential's (the diploma's) — the operator names the scope.
+        subject_scope: Some("pid_eudi".into()),
     }
 }
 
@@ -365,10 +368,10 @@ fn a_typo_refuses_the_translation() {
         "the refusal names the typo: {err:#}"
     );
 }
-/// The translated config boots the REAL service: the `--from-vc-layout`
-/// mode reads the vc layout, translates, and starts — the drop-in
-/// replacement's acceptance. The fixture is the gdc shape with local
-/// keys and memory storage.
+/// The translated config boots the REAL service: the tool's output is
+/// written like any config file and the service boots from it — the
+/// drop-in's acceptance. The fixture is the gdc shape with local keys
+/// and memory storage.
 #[tokio::test]
 async fn the_translated_layout_boots_the_service_healthy() {
     use std::process::Stdio;
@@ -377,8 +380,6 @@ async fn the_translated_layout_boots_the_service_healthy() {
     let dir = std::env::temp_dir().join(format!("siros-verifier-vc-boot-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // A real key pair for the request/OP signing (the startup suite's
-    // rcgen pattern).
     let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
     let cert = rcgen::CertificateParams::new(vec!["verifier.example".to_string()])
         .unwrap()
@@ -398,17 +399,25 @@ async fn the_translated_layout_boots_the_service_healthy() {
     let layout_path = dir.join("config.yaml");
     std::fs::write(&layout_path, layout).unwrap();
 
+    // The tool step: translate the layout into the config file.
+    let options = siros_verifier_service::vc_layout::TranslateOptions {
+        subject_pointer: Some("/given_name".into()),
+        ..Default::default()
+    };
+    let translation = siros_verifier_service::vc_layout::translate(
+        &std::fs::read_to_string(&layout_path).unwrap(),
+        &dir,
+        &options,
+    )
+    .expect("the fixture translates");
+    let config_path = dir.join("proxy.toml");
+    std::fs::write(&config_path, &translation.toml).unwrap();
+
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
     let mut child = Command::new(env!("CARGO_BIN_EXE_siros-verifier-service"))
-        .arg("--from-vc-layout")
-        .arg(&layout_path)
-        // The fixture carries an OP: the explicit subject mapping the
-        // translation demands (the given_name claim is the fixture's
-        // unique-enough identifier).
-        .arg("--subject-pointer")
-        .arg("/given_name")
+        .arg(&config_path)
         .env("TUNNELBANA_BIND", address.to_string())
         .env(
             "SIROS_VERIFIER_STATE_KEY",
@@ -422,8 +431,6 @@ async fn the_translated_layout_boots_the_service_healthy() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let healthy = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
-            // A child that exited cannot have answered /health: collect
-            // its stderr on the failure path only.
             if let Ok(Some(status)) = child.try_wait() {
                 let _ = child.kill().await;
                 panic!("the translated boot exited: {status}");
@@ -439,7 +446,7 @@ async fn the_translated_layout_boots_the_service_healthy() {
     .await;
     assert!(
         healthy.is_ok(),
-        "the service booted from the vc layout and answered /health"
+        "the service booted from the translated config and answered /health"
     );
     let _ = child.kill().await;
     let _ = std::fs::remove_dir_all(&dir);
@@ -464,26 +471,128 @@ fn the_fallback_dcql_requests_the_subject_identifier() {
         .get("credentials")
         .and_then(|v| v.as_array())
         .unwrap();
-    let first = credentials[0].as_table().unwrap();
-    let claims = first
-        .get("claims")
-        .and_then(|v| v.as_array())
-        .expect("the first fallback query carries claims");
-    let paths: Vec<String> = claims
-        .iter()
-        .filter_map(|c| {
-            let segments: Vec<String> = c
-                .as_table()?
-                .get("path")?
-                .as_array()?
-                .iter()
-                .map(|p| p.as_str().unwrap().to_string())
-                .collect();
-            Some(segments.join("."))
-        })
-        .collect();
+    // The NAMED scope's query carries the identifier claim (the first
+    // supported credential — the diploma — must NOT: an unfulfillable
+    // claim would break every OP login).
+    let paths_for = |scope: &str| -> Vec<String> {
+        credentials
+            .iter()
+            .filter_map(|c| -> Option<Vec<String>> {
+                let table = c.as_table()?;
+                if table.get("id").and_then(|v| v.as_str()) != Some(scope) {
+                    return None;
+                }
+                Some(
+                    table
+                        .get("claims")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|c| {
+                            let segments: Vec<String> = c
+                                .as_table()?
+                                .get("path")?
+                                .as_array()?
+                                .iter()
+                                .map(|p| p.as_str().unwrap().to_string())
+                                .collect();
+                            Some(segments.join("."))
+                        })
+                        .collect(),
+                )
+            })
+            .flatten()
+            .collect()
+    };
+    let pid_paths = paths_for("pid_eudi");
     assert!(
-        paths.contains(&"personal_administrative_number".to_string()),
-        "the fallback requests the configured identifier claim (paths: {paths:?})"
+        pid_paths.contains(&"personal_administrative_number".to_string()),
+        "the named scope's query requests the identifier claim (paths: {pid_paths:?})"
+    );
+    // The subject query is FIRST: the runtime's merge takes the first
+    // credential carrying the claim, so the diploma's own claim of the
+    // same name must never precede the selected PID's.
+    let first_id = credentials[0]
+        .as_table()
+        .unwrap()
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(
+        first_id, "pid_eudi",
+        "the subject scope's query leads the fallback (first: {first_id})"
+    );
+    let diploma_paths = paths_for("diploma");
+    assert!(
+        !diploma_paths.contains(&"personal_administrative_number".to_string()),
+        "the first supported credential's query must not carry the identifier (a diploma has no PAN)"
+    );
+}
+
+#[test]
+fn the_tool_writes_a_reviewable_artifact() {
+    // The tool's own surface: the report on stderr, the proxy.toml at
+    // -o in owner-only mode, exit 0 — the artifact the deployment's
+    // config management consumes.
+    let dir = std::env::temp_dir().join(format!("siros-verifier-vc-tool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("proxy.toml");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_vc-layout"))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/vc-layout/gdc.yaml"
+        ))
+        .arg("-o")
+        .arg(&out)
+        .arg("--allow-insecure-pdp")
+        .arg("--subject-pointer")
+        .arg("/personal_administrative_number")
+        .arg("--subject-scope")
+        .arg("pid_eudi")
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "the tool exits 0: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains("translated (") && stderr.contains("known-unsupported"),
+        "the report rides stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("the migration checklist"),
+        "the checklist framing is part of the report"
+    );
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        text.starts_with("base_url = \"https://sirosid-gdc-vc-verifier.fly.dev\""),
+        "the emitted proxy.toml is the real translation"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the artifact is owner-only");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_subject_scope_without_an_emitted_query_refuses() {
+    // A named scope that does not resolve to an emitted fallback query
+    // (not among supported_credentials, or dropped for its format)
+    // would leave the fallback without the subject identifier — refuse
+    // rather than emit a config whose OP logins fail late.
+    let mut options = full_gdc_options();
+    options.subject_scope = Some("no_such_credential".into());
+    let err = match translate_gdc_with(&options) {
+        Ok(_) => panic!("an unresolvable subject scope must refuse"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("no_such_credential"),
+        "the refusal names the scope: {err:#}"
     );
 }

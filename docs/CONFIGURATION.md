@@ -147,27 +147,45 @@ In a multi-replica deployment every replica must carry the same pair set through
 
 The state-encryption key rotates the same way through `previous_state_encryption_keys` (retained for decryption only, never for sealing).
 
-## Running from the vc-stack verifier's configuration layout
+## Migrating from the vc-stack verifier's configuration layout
 
-A deployment already running the vc-stack verifier can point this service at the SAME configuration — the `common:` + `verifier:` `config.yaml`:
+The `vc-layout` tool (in the release image, alongside the service)
+translates the vc-stack verifier's `config.yaml` into this service's
+proxy.toml. It is a **migration aid**: run it once against the
+deployment's existing configuration, read the report — the migration
+checklist of every mapped member, every vc capability this service
+does not support, and every decision the operator must make — and take
+the emitted proxy.toml as the starting point for the deployment's own
+config management.
 
 ```sh
-siros-verifier-service --from-vc-layout /etc/vc/config.yaml
+vc-layout <config.yaml> [-o proxy.toml] [--allow-insecure-pdp] \
+        [--subject-pointer <claim>] [--subject-scope <credential>]
 ```
 
-The adapter translates that layout into this service's proxy.toml at boot (or with `--emit-toml <path>`, writes it — owner-only mode — for inspection and exits). Relative file members resolve against the source yaml's own directory, so the emitted config is location-independent; the state secret reads the same `SIROS_VERIFIER_STATE_KEY` env var the deploy tooling already sets, and the vc `api_server.addr` becomes the service's bind (an explicit `TUNNELBANA_BIND` wins). A plain-HTTP PDP on a non-loopback address — the vc layouts' private-network posture — needs the explicit `--allow-insecure-pdp` opt-in; without it the translation refuses and names the flag.
+The report goes to stderr; the proxy.toml to stdout or `-o`
+(owner-only). Every source member lands in one of three buckets:
+**mapped** (translated), **known-unsupported** (a recognized vc
+capability the deployment runs without — named), or **unknown** (a typo
+or a new vc-stack feature that would otherwise silently vanish — the
+translation refuses, naming the path). File paths carry over verbatim —
+the same volume mounts for the signing keys, the chains and the
+circuit artifacts serve the translated deployment — and the state
+secret reads the same `SIROS_VERIFIER_STATE_KEY` env var.
 
-When the layout enables the OP (`verifier.outbound.oidc_provider`), the translation also demands `--subject-pointer <claim-path>` — a **unique** identifier claim for the OIDC subject. A holder's name is not one: two holders sharing a family name would share a subject, so the adapter never silently defaults the OP's subject. Without an OP, the backend's own subject pointer defaults to the PID `family_name` (the report says so).
+Two policy edges are explicit flags, never silent behavior: a
+plain-HTTP PDP on a non-loopback address needs `--allow-insecure-pdp`
+(the vc layouts' private-network posture), and an enabled OP demands
+`--subject-pointer` with a **unique** identifier claim (a holder's name
+is not one) plus `--subject-scope` naming the supported credential
+whose query carries it (a PAN belongs on a PID query, not a diploma's).
 
-Every member of the source document lands in one of three buckets, and the translation prints the report:
+**Integration shapes for k8s config management** — the initContainer
+translation (helm), the run-once committed artifact (kustomize), and
+the rewrite-natively end state — are exemplified in
+[`docs/examples/vc-layout/`](examples/vc-layout/README.md).
 
-- **mapped** — translated to its equivalent (the keys, the OP's client roster and TTLs, the presentation timeout, the PDP, the mongo URI, the presets, the nym-auth circuits, the registry mirrors, the WRPRC);
-- **known-unsupported** — a recognized vc-stack capability this service has no equivalent for (a warning naming the capability: ldp_vc, the OTLP export, the sidecar-rendered secrets file, TS12, pairwise subjects…);
-- **unknown** — a member the adapter does not know: either a typo or a NEW vc-stack feature that would otherwise silently vanish from the translated deployment. The translation refuses, naming the path.
-
-Two consequences the report always states: the OIDC OP moves from the verifier's root to `<base_url>/OIDC` (the RPs' discovery and token URLs must follow), and the derived defaults (the subject pointer, the go-trust role name, the flow store's database/collection) are the operator's to adjust.
-
-## UI presets
+## UI presets## UI presets
 
 `frontend.config.presets` is an array of tables with `id`, `label`, and `dcql`. Registry-derived presets are merged by credential format and type; the registry's full claim list remains available for editing. Configure the requested claim subset for your deployment and include a subject claim—the first claim becomes the subject when no custom pointer is configured.
 
