@@ -1,0 +1,56 @@
+# A minimal VC-layout document shaped like the gdc deployment's, but with
+# local paths and no mongo (memory storage) so the translated config can
+# boot the real service in a test. The structural shape — the members the
+# adapter reads — mirrors service/testdata/vc-layout/gdc.yaml.
+common:
+  production: false
+  credential_metadata:
+    pid_eudi:
+      format: dc+sd-jwt
+      vct: urn:eudi:pid:1
+verifier:
+  api_server:
+    addr: :9001
+  public_url: https://verifier.example
+  key_config:
+    chain_path: KEYCHAIN_PLACEHOLDER
+    private_key_path: KEY_PLACEHOLDER
+  inbound:
+    openid4vp:
+      clients:
+        https://rp.example/:
+          redirect_uri: https://rp.example/cb
+          type: public
+      presentation_timeout: 300
+      supported_credentials:
+      - scopes:
+        - pid_eudi
+        vct: urn:eudi:pid:1
+      token_endpoint: https://verifier.example/token
+  outbound:
+    oidc_provider:
+      access_token_duration: 3600
+      code_duration: 600
+      id_token_duration: 3600
+      issuer: https://verifier.example
+      refresh_token_duration: 86400
+      session_duration: 900
+      subject_type: public
+      subject_salt: a-fixed-salt-for-the-boot-fixture
+  digital_credentials:
+    auto_attempt: false
+    enable: true
+    use_jar: false
+  presets:
+    PID:
+      credentials:
+        pid_eudi:
+          claims:
+          - path:
+            - given_name
+          - path:
+            - family_name
+  trust:
+    pdp_url: http://127.0.0.1:1/evaluation
+  zk_circuits:
+    sources: []

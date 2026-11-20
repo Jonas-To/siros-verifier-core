@@ -1,0 +1,302 @@
+common:
+  branding:
+    favicon_path: /branding-assets/favicon.png
+    logo_path: /branding-assets/logo.png
+  credential_metadata:
+    accredify_individual_id:
+      credential_contexts:
+      - https://schemas.accredify.io/idvc/individual-id/v1/context
+      credential_type_values:
+      - - https://www.w3.org/2018/credentials#VerifiableCredential
+        - https://schemas.accredify.io/idvc/vocab/v1/vocab#IndividualIDCredential
+      credential_types:
+      - VerifiableCredential
+      - IndividualIDCredential
+      format: ldp_vc
+      vctm_file_path: /vctms/accredify_individual_id.json
+    diploma:
+      format: dc+sd-jwt
+      vct: urn:eudi:diploma:1
+    ebw_oid:
+      format: dc+sd-jwt
+      vct: uri:eu.ebw.oid.1
+    ehic:
+      format: dc+sd-jwt
+      vct: urn:eudi:ehic:1
+    eu_poa:
+      format: dc+sd-jwt
+      vct: uri:eu.eudi.eu-poa.1
+    eucc:
+      format: dc+sd-jwt
+      vct: urn:eudi:eucc:1
+    iban_ov:
+      format: dc+sd-jwt
+      vct: eu.we-build.iban-ov.1
+    mdl:
+      doctype: org.iso.18013.5.1.mDL
+      format: mso_mdoc
+      mddl_file_path: /vctms/mdl.mdoc.json
+    mdl_zk4:
+      doctype: org.iso.18013.5.1.mDL
+      format: mso_mdoc
+      mddl_file_path: /vctms/mdl_zk4.mdoc.json
+    nym_auth:
+      doctype: eu.europa.ec.eudi.nym_auth.1
+      format: mso_mdoc
+      mddl_file_path: /vctms/nym_auth.mdoc.json
+    photoid:
+      doctype: eu.europa.ec.eudi.photoid.1
+      format: mso_mdoc
+      mddl_file_path: /vctms/photoid.mdoc.json
+    pid_1_5:
+      format: dc+sd-jwt
+      vct: urn:eudi:pid:arf-1.5:1
+    pid_1_8:
+      format: dc+sd-jwt
+      vct: urn:eudi:pid:arf-1.8:1
+    pid_eudi:
+      format: dc+sd-jwt
+      vct: urn:eudi:pid:1
+    pid_mdoc:
+      doctype: eu.europa.ec.eudi.pid.1
+      format: mso_mdoc
+      mddl_file_path: /vctms/pid_mdoc.mdoc.json
+    pid_mdoc_id:
+      doctype: eu.europa.ec.eudi.pid.1
+      format: mso_mdoc
+      mddl_file_path: /vctms/pid_mdoc_id.mdoc.json
+    siros_id:
+      format: dc+sd-jwt
+      vct: https://registry.siros.org/sirosfoundation/siros_id.vctm.json
+  ha:
+    cache_database_name: verifier_cache
+    enable: true
+  mongo:
+    uri: mongodb://root:REDACTED-FOR-THE-FIXTURE@sirosid-gdc-mongodb.internal:27017/?authSource=admin
+  production: false
+  tracing:
+    addr: otlp-collector:4318
+    enable: false
+  credential_registry:
+    enable: true
+    registries:
+    - mirrors:
+      - base_url: https://registry.siros.org
+        timeout: 10s
+    refresh_interval: 1h
+verifier:
+  api_server:
+    addr: :8080
+  digital_credentials:
+    auto_attempt: false
+    enable: true
+    use_jar: false
+  inbound:
+    openid4vp:
+      clients:
+        https://sirosid-gdc-wallet-frontend.fly.dev/id/default/:
+          redirect_uri: https://sirosid-gdc-wallet-frontend.fly.dev/id/default/cb
+          scopes:
+          - diploma
+          - ebw_oid
+          - ehic
+          - eu_poa
+          - eucc
+          - iban_ov
+          - mdl
+          - mdl_zk4
+          - nym_auth
+          - photoid
+          - pid_1_5
+          - pid_1_8
+          - pid_eudi
+          - pid_mdoc
+          - pid_mdoc_id
+          - siros_id
+          type: public
+      presentation_requests_dir: /pres-reqs
+      presentation_timeout: 300
+      supported_credentials:
+      - scopes:
+        - diploma
+        vct: urn:eudi:diploma:1
+      - scopes:
+        - ebw_oid
+        vct: uri:eu.ebw.oid.1
+      - scopes:
+        - ehic
+        vct: urn:eudi:ehic:1
+      - scopes:
+        - eu_poa
+        vct: uri:eu.eudi.eu-poa.1
+      - scopes:
+        - eucc
+        vct: urn:eudi:eucc:1
+      - scopes:
+        - iban_ov
+        vct: eu.we-build.iban-ov.1
+      - scopes:
+        - mdl
+        vct: org.iso.18013.5.1.mDL
+      - scopes:
+        - mdl_zk4
+        vct: org.iso.18013.5.1.mDL
+      - scopes:
+        - nym_auth
+        vct: eu.europa.ec.eudi.nym_auth.1
+      - scopes:
+        - photoid
+        vct: eu.europa.ec.eudi.photoid.1
+      - scopes:
+        - pid_1_5
+        vct: urn:eudi:pid:arf-1.5:1
+      - scopes:
+        - pid_1_8
+        vct: urn:eudi:pid:arf-1.8:1
+      - scopes:
+        - pid_eudi
+        vct: urn:eudi:pid:1
+      - scopes:
+        - pid_mdoc
+        vct: eu.europa.ec.eudi.pid.1
+      - scopes:
+        - pid_mdoc_id
+        vct: eu.europa.ec.eudi.pid.1
+      - scopes:
+        - siros_id
+        vct: https://registry.siros.org/sirosfoundation/siros_id.vctm.json
+      token_endpoint: https://sirosid-gdc-vc-verifier.fly.dev/token
+  key_config:
+    chain_path: /pki/signing_ec_chain.pem
+    private_key_path: /pki/signing_ec_private.pem
+  nym_auth:
+    circuits:
+      allow:
+      - artifact_bytes: 1062842
+        artifact_path: /etc/vc/circuits/nym_auth-ssc.bin
+        artifact_sha256: 92dd42fdf99673249eec33c7d07850bd9da66fbdab01ef26391e04c8341c1b7f
+        block_enc_hash: 6983
+        block_enc_sig: 4679
+        config: known-offender-matching-ssc
+        hash_circuit_id: 5f8c75ae5c3893ef6ab6a079628cb385ba85e95a85437d58570c455289d75729
+        sig_circuit_id: 00513797c75b2eab1a9db75004977c15317d4e40c0db1d00674523431baa75cb
+        system_id: urn:circuits:longfellow:nym_auth:v1
+      - artifact_bytes: 12205144
+        artifact_path: /etc/vc/circuits/nym_auth-vega-ssc.bin
+        artifact_sha256: 4da5e73afb9be2682e70be793c9956a73304e21f31246aa10da0d3e95c926425
+        config: known-offender-matching-ssc
+        system_id: urn:circuits:vega:nym_auth:v1
+    enable: true
+    verifier_id: x509_san_dns:sirosid-gdc-vc-verifier.fly.dev
+  outbound:
+    oidc_provider:
+      access_token_duration: 3600
+      code_duration: 600
+      enable_userinfo: true
+      id_token_duration: 3600
+      issuer: https://sirosid-gdc-vc-verifier.fly.dev
+      refresh_token_duration: 86400
+      session_duration: 900
+      subject_type: pairwise
+      subject_salt: TXZtzVWSWjZmVmIzyt41gNYNRQurcFQT
+  preferred_vp_formats:
+    dc+sd-jwt:
+      kb-jwt_alg_values:
+      - ES256
+      sd-jwt_alg_values:
+      - ES256
+    ldp_vc:
+      cryptosuite_values:
+      - ecdsa-rdfc-2019
+      - ecdsa-sd-2023
+      - eddsa-rdfc-2022
+      proof_type_values:
+      - DataIntegrityProof
+    zkp_req:
+      proof_system_values:
+      - longfellow-libzk-v1
+      - vega-v1
+      system_id_values:
+      - urn:circuits:longfellow:nym_auth:v1
+      - urn:circuits:vega:nym_auth:v1
+  presets:
+    Accredify SG - Individual ID (VCDM 2.0):
+      category: Accredify
+      credentials:
+        accredify_individual_id:
+          claims:
+          - path:
+            - credentialSubject
+            - fullName
+          - path:
+            - credentialSubject
+            - email
+    Age Over 18 - ZK Proof (Vega):
+      category: ZK Proofs
+      credentials:
+        mdl_zk4:
+          claims:
+          - path:
+            - org.iso.18013.5.1
+            - age_over_18
+          format: mso_mdoc_zk
+          zk_system_type:
+          - id: vega-mc-p256-v1-prover-key-r12
+            system: vega-mc-p256-v1
+    PID (mdoc) - ZK Proof (Vega):
+      category: ZK Proofs
+      credentials:
+        mdl_zk4:
+          claims:
+          - path:
+            - org.iso.18013.5.1
+            - family_name
+          - path:
+            - org.iso.18013.5.1
+            - given_name
+          format: mso_mdoc_zk
+          zk_system_type:
+          - id: vega-mc-p256-v1-prover-key-r12
+            system: vega-mc-p256-v1
+    nym_auth_pseudonym:
+      category: ZK Proofs
+      credentials:
+        nym_auth:
+          format: zkp_req
+          req:
+          - fn_id: pseudonym
+            params:
+              config: known-offender-matching-ssc
+              prf: sha-256
+              ver: 1
+            return: nym
+          validate: nym_auth
+    nym_auth_pseudonym_age:
+      category: ZK Proofs
+      credentials:
+        nym_auth:
+          format: zkp_req
+          req:
+          - fn_id: pseudonym
+            params:
+              config: known-offender-matching-ssc
+              prf: sha-256
+              ver: 1
+            return: nym
+          - fn_id: age_check
+            params:
+              ge: '1980-01-01'
+              le: '2000-12-31'
+            return: age
+          validate: nym_auth
+  public_url: https://sirosid-gdc-vc-verifier.fly.dev
+  supported_wallets:
+    SIROS ID (dev): https://sirosid-gdc-wallet-frontend.fly.dev/id/default/cb
+    SIROS Native App: openid4vp://cb
+  trust:
+    pdp_url: http://sirosid-gdc-pdp.internal:8080
+    wallet_attestation:
+      enabled: true
+  zk_circuits:
+    sources:
+    - https://zk-circuits-test.fly.dev
