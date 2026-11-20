@@ -44,11 +44,27 @@ fn main() {
             "--allow-insecure-pdp" => options.allow_insecure_pdp = true,
             "--subject-pointer" => {
                 i += 1;
-                options.subject_pointer = args.get(i).cloned();
+                options.subject_pointer = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| {
+                            eprintln!("--subject-pointer needs a claim path\n\n{HELP}");
+                            std::process::exit(2);
+                        })
+                        .unwrap(),
+                );
             }
             "--subject-scope" => {
                 i += 1;
-                options.subject_scope = args.get(i).cloned();
+                options.subject_scope = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| {
+                            eprintln!("--subject-scope needs a credential scope\n\n{HELP}");
+                            std::process::exit(2);
+                        })
+                        .unwrap(),
+                );
             }
             "-h" | "--help" => {
                 print!("{}", HELP);
@@ -115,7 +131,11 @@ fn main() {
             // destination, so no interval exists with a permissive
             // file, and a pre-existing permissive output is replaced
             // atomically.
-            let temp = format!("{path}.tmp");
+            // A UNIQUE temp per attempt: an interrupted run's stale
+            // sibling (the emptyDir survives container restarts) never
+            // blocks a retry — each attempt gets its own, still created
+            // exclusively at 0600.
+            let temp = format!("{path}.tmp.{}", std::process::id());
             let mut created = false;
             let write_result = (|| {
                 #[cfg(unix)]
