@@ -38,3 +38,9 @@ proxy.toml, the secrets ride env vars (`SIROS_VERIFIER_STATE_KEY`, and
 the mongo URI's own credentials inside the translated config), and the
 vc layout's file paths carry over verbatim — the same volume mounts for
 the signing keys and chains serve the translated deployment.
+
+**As a skill**: an agent-executable runbook for the whole migration
+(running the tool, reading the three-bucket report, resolving the
+refusals, moving the credentials, choosing the integration shape,
+verifying the boot) lives at
+[`.github/skills/vc-layout-migration/SKILL.md`](../../.github/skills/vc-layout-migration/SKILL.md).
